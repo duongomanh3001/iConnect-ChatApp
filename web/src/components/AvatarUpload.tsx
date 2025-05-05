@@ -1,8 +1,8 @@
 import React, { useState, useRef, useEffect } from "react";
-import axios from "axios";
 import { useAppSelector, useAppDispatch } from "../redux/hooks";
 import { updateUserSuccess } from "../redux/slices/authSlice";
 import { uploadAvatar } from "../api/auth";
+import { uploadImageToCloudinary } from "../api/cloudinary";
 import "../scss/AvatarUpload.scss";
 
 interface AvatarUploadProps {
@@ -37,11 +37,13 @@ const AvatarUpload: React.FC<AvatarUploadProps> = ({
   }, [user, userId]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    console.log("File change handler triggered", e.target.files);
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
+      console.log("Selected file:", file.name, "Size:", Math.round(file.size / 1024), "KB", "Type:", file.type);
 
-      // Kiểm tra kích thước file (max 10MB)
-      if (file.size > 10 * 1024 * 1024) {
+      // Kiểm tra kích thước file (max 5MB)
+      if (file.size > 5 * 1024 * 1024) {
         setError("Kích thước file không được vượt quá 5MB");
         return;
       }
@@ -55,6 +57,9 @@ const AvatarUpload: React.FC<AvatarUploadProps> = ({
       setSelectedFile(file);
       setPreviewUrl(URL.createObjectURL(file));
       setError(null);
+      console.log("File selected successfully, preview URL created");
+    } else {
+      console.log("No file selected or file selection cancelled");
     }
   };
 
@@ -78,40 +83,75 @@ const AvatarUpload: React.FC<AvatarUploadProps> = ({
     }
 
     setLoading(true);
-    setError(null);
     setSuccess(null);
+    setError(null);
 
     try {
-      // Trong ứng dụng thực tế, bạn cần upload file lên một dịch vụ lưu trữ như Cloudinary
-      // Trong ví dụ này, để đơn giản, chúng ta giả định chỉ sử dụng file local như base64
+      // Kiểm tra kích thước file trước khi đọc
+      if (selectedFile.size > 5 * 1024 * 1024) { // 5MB limit
+        setError("Kích thước file quá lớn (tối đa 5MB). Vui lòng chọn file nhỏ hơn.");
+        setLoading(false);
+        return;
+      }
+
+      // Đọc file dưới dạng base64
       const reader = new FileReader();
       reader.readAsDataURL(selectedFile);
       reader.onload = async () => {
         const base64Image = reader.result as string;
 
-        // Log thông tin để debug
-        console.log("Uploading avatar for userId:", actualUserId);
-
-        // Cập nhật avatar trong database
-        const updatedUser = await uploadAvatar(actualUserId, base64Image);
-
-        // Cập nhật state Redux
-        dispatch(updateUserSuccess(updatedUser));
-
-        setSuccess("Avatar đã được cập nhật thành công");
-
-        // Gọi callback onSuccess nếu được cung cấp
-        if (onSuccess) {
-          onSuccess(base64Image);
+        try {
+          // Upload image to Cloudinary first
+          setSuccess("Đang tải ảnh lên Cloudinary...");
+          console.log("Uploading avatar to Cloudinary...");
+          console.log("File size before processing:", Math.round(base64Image.length / 1024), "KB");
+          
+          const cloudinaryUrl = await uploadImageToCloudinary(base64Image, "italk_app/avatars");
+          
+          console.log("Cloudinary upload successful:", cloudinaryUrl);
+          setSuccess("Đang cập nhật thông tin người dùng...");
+          console.log("Updating avatar for userId:", actualUserId);
+          
+          // Update the avatar URL in the database
+          const updatedUser = await uploadAvatar(actualUserId, cloudinaryUrl);
+          
+          // Update Redux state
+          dispatch(updateUserSuccess(updatedUser));
+          
+          setSuccess("Avatar đã được cập nhật thành công");
+          
+          // Call onSuccess callback if provided
+          if (onSuccess) {
+            onSuccess(cloudinaryUrl);
+          }
+        } catch (uploadError: any) {
+          console.error("Lỗi chi tiết:", uploadError);
+          let errorMessage = "Có lỗi xảy ra khi upload avatar";
+          
+          if (uploadError.message.includes("request entity too large")) {
+            errorMessage = "Kích thước ảnh quá lớn. Vui lòng chọn ảnh nhỏ hơn hoặc giảm kích thước ảnh.";
+          } else if (uploadError.message.includes("timeout")) {
+            errorMessage = "Quá thời gian kết nối. Vui lòng thử lại hoặc chọn ảnh nhỏ hơn.";
+          } else if (uploadError.message.includes("network")) {
+            errorMessage = "Lỗi kết nối mạng. Vui lòng kiểm tra kết nối và thử lại.";
+          } else if (uploadError.response) {
+            errorMessage = `Lỗi máy chủ: ${uploadError.response.status} - ${uploadError.response.data.message || uploadError.message}`;
+          }
+          
+          setError(errorMessage);
+        } finally {
+          setLoading(false);
         }
-
+      };
+      
+      reader.onerror = (event) => {
+        console.error("Lỗi khi đọc file:", event);
+        setError("Không thể đọc file. Vui lòng thử lại với file khác.");
         setLoading(false);
       };
     } catch (err: any) {
-      console.error("Lỗi khi upload avatar:", err);
-      setError(
-        err.response?.data?.message || "Có lỗi xảy ra khi upload avatar"
-      );
+      console.error("Lỗi khi đọc file:", err);
+      setError("Không thể đọc file. Vui lòng thử lại.");
       setLoading(false);
     }
   };
@@ -145,18 +185,17 @@ const AvatarUpload: React.FC<AvatarUploadProps> = ({
       const imgTest = new Image();
       imgTest.onload = async () => {
         try {
-          // Log thông tin để debug
-          console.log("Uploading avatar URL for userId:", actualUserId);
-
-          // Cập nhật avatar trong database
+          console.log("Updating avatar URL for userId:", actualUserId);
+          
+          // Cập nhật avatar trong database trực tiếp với URL đã cung cấp
           const updatedUser = await uploadAvatar(actualUserId, directUrl);
-
+          
           // Cập nhật state Redux
           dispatch(updateUserSuccess(updatedUser));
-
+          
           setSuccess("Avatar đã được cập nhật thành công");
           setPreviewUrl(directUrl);
-
+          
           // Gọi callback onSuccess nếu được cung cấp
           if (onSuccess) {
             onSuccess(directUrl);
@@ -192,12 +231,6 @@ const AvatarUpload: React.FC<AvatarUploadProps> = ({
     }
   };
 
-  const triggerFileInput = () => {
-    if (fileInputRef.current) {
-      fileInputRef.current.click();
-    }
-  };
-
   const handleRemoveAvatar = () => {
     setSelectedFile(null);
     setPreviewUrl(null);
@@ -225,7 +258,10 @@ const AvatarUpload: React.FC<AvatarUploadProps> = ({
             className={`btn ${
               uploadMethod === "file" ? "btn-primary" : "btn-outline-primary"
             }`}
-            onClick={() => setUploadMethod("file")}
+            onClick={() => {
+              console.log("File upload method button clicked");
+              setUploadMethod("file");
+            }}
           >
             Upload từ máy
           </button>
@@ -234,7 +270,10 @@ const AvatarUpload: React.FC<AvatarUploadProps> = ({
             className={`btn ${
               uploadMethod === "url" ? "btn-primary" : "btn-outline-primary"
             }`}
-            onClick={() => setUploadMethod("url")}
+            onClick={() => {
+              console.log("URL upload method button clicked");
+              setUploadMethod("url");
+            }}
           >
             Dùng URL
           </button>
@@ -244,11 +283,7 @@ const AvatarUpload: React.FC<AvatarUploadProps> = ({
       {uploadMethod === "file" ? (
         <div className="file-upload-section">
           <div className="avatar-actions">
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={triggerFileInput}
-            >
+            <label className="btn btn-primary mb-0">
               {loading ? (
                 <span
                   className="spinner-border spinner-border-sm"
@@ -258,7 +293,16 @@ const AvatarUpload: React.FC<AvatarUploadProps> = ({
               ) : (
                 "Chọn ảnh"
               )}
-            </button>
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(e) => {
+                  console.log("File input change event triggered directly");
+                  handleFileChange(e);
+                }}
+                style={{ display: "none" }}
+              />
+            </label>
 
             {previewUrl && previewUrl !== currentAvatar && (
               <button
@@ -287,7 +331,10 @@ const AvatarUpload: React.FC<AvatarUploadProps> = ({
             ref={fileInputRef}
             className="file-input"
             accept="image/*"
-            onChange={handleFileChange}
+            onChange={(e) => {
+              console.log("File input change event triggered");
+              handleFileChange(e);
+            }}
             style={{ display: "none" }}
           />
         </div>

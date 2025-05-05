@@ -67,6 +67,7 @@
 
     button {
       flex: 1;
+      z-index: 1;
     }
   }
 }
@@ -83,13 +84,30 @@
   justify-content: center;
   margin-top: 10px;
 
-  button {
+  button, label.btn {
     min-width: 100px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 38px;
+    margin-bottom: 0;
   }
 }
 
 .input-group {
   margin-top: 0.5rem;
+}
+
+label.btn input[type="file"] {
+  position: absolute;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  height: 1px;
+  width: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
 }
 
 .avatar-tips {
@@ -111,13 +129,11 @@
   }
 }
 
-// Hiệu ứng khi hover vào ảnh đại diện
 .avatar-preview img:hover,
 .avatar-preview .avatar-placeholder:hover {
   cursor: pointer;
 }
 
-// Responsive
 @media (max-width: 576px) {
   .avatar-upload-container {
     padding: 1rem;
@@ -132,7 +148,7 @@
   .avatar-actions {
     flex-wrap: wrap;
 
-    button {
+    button, label.btn {
       margin-bottom: 5px;
       width: 100%;
     }

@@ -582,23 +582,51 @@ const uploadToCloudinary = async (req, res) => {
       return res.status(400).json({ message: 'Invalid image format' });
     }
 
-    // Upload to Cloudinary
-    const result = await cloudinary.uploader.upload(image, {
+    // Log the size of the incoming image
+    const imageSizeInKB = Math.round((image.length * 3) / 4 / 1024);
+    console.log(`Image size before Cloudinary processing: ${imageSizeInKB} KB`);
+    
+    // Add optimization parameters
+    const uploadOptions = {
       folder: folder || 'italk_app',
       resource_type: 'auto',
-      use_filename: true
-    });
+      use_filename: true,
+      quality: 'auto',
+      fetch_format: 'auto',
+      flags: 'lossy',
+      transformation: [
+        { width: 'auto', crop: 'scale', quality: 'auto' },
+        { dpr: 'auto' }
+      ]
+    };
+    
+    console.log('Uploading to Cloudinary with optimization parameters');
+    
+    // Upload to Cloudinary with optimization
+    const result = await cloudinary.uploader.upload(image, uploadOptions);
 
-    console.log('Successfully uploaded to Cloudinary:', result.secure_url);
+    console.log(`Successfully uploaded to Cloudinary: ${result.secure_url}`);
+    console.log(`Final image size on Cloudinary: ${Math.round(result.bytes / 1024)} KB`);
     
     // Return the image URL
     return res.status(200).json({
       message: 'Upload successful',
       url: result.secure_url,
-      public_id: result.public_id
+      public_id: result.public_id,
+      size: {
+        original: imageSizeInKB,
+        optimized: Math.round(result.bytes / 1024)
+      }
     });
   } catch (error) {
     console.error('Error uploading to Cloudinary:', error);
+    // Check for specific error types
+    if (error.message.includes('reached limit') || error.message.includes('too large')) {
+      return res.status(413).json({ 
+        message: 'Image is too large. Please use a smaller image or compress it first.',
+        error: error.message 
+      });
+    }
     return res.status(500).json({ 
       message: 'Failed to upload image to Cloudinary',
       error: error.message 

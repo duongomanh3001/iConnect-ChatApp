@@ -27,8 +27,11 @@ mongoose
 
 // Middleware
 app.use(cors());
-app.use(bodyParser.json());
-app.use(express.json());
+// Tăng giới hạn kích thước request body cho uploads
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
