@@ -16,14 +16,15 @@ import { useRoute, useNavigation } from "@react-navigation/native";
 import { Ionicons } from "@expo/vector-icons";
 import axios from "axios";
 import { AuthContext } from "../../context/AuthContext";
-import { API_URL, SOCKET_URL } from "../../config/constants";
+import { API_URL } from "../../config/constants";
 import moment from "moment";
 import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from "expo-document-picker";
-import { io } from "socket.io-client";
 import { Audio } from "expo-av";
 import * as FileSystem from "expo-file-system";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import socketService from "../../services/socketService";
+import { Socket } from "socket.io-client";
 
 interface Message {
   _id: string;
@@ -45,6 +46,12 @@ interface Message {
     sender: string;
   };
   unsent: boolean;
+  roomId?: string;
+  receiver?: string | {
+    _id: string;
+    name?: string;
+    avt?: string;
+  };
 }
 
 interface RouteParams {
@@ -52,11 +59,12 @@ interface RouteParams {
   chatName: string;
   contactId: string;
   contactAvatar: string;
+  isGroup?: boolean;
 }
 
 const ChatDetailScreen = () => {
   const route = useRoute();
-  const { chatId, chatName, contactId, contactAvatar } =
+  const { chatId, chatName, contactId, contactAvatar, isGroup = false } =
     route.params as RouteParams;
   const navigation = useNavigation<any>();
   const { user } = useContext(AuthContext);
@@ -67,65 +75,345 @@ const ChatDetailScreen = () => {
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState(false);
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  const [isTyping, setIsTyping] = useState(false);
+  const [typingTimeout, setTypingTimeout] = useState<NodeJS.Timeout | null>(null);
+  const [groupInfo, setGroupInfo] = useState<any>(null);
+  const [groupMembers, setGroupMembers] = useState<any[]>([]);
 
-  const socketRef = useRef<any>(null);
+  const socketRef = useRef<Socket | null>(null);
   const recordingRef = useRef<Audio.Recording | null>(null);
   const flatListRef = useRef<FlatList>(null);
+  const roomIdRef = useRef<string>('');
 
-  // Initialize socket connection
+  // Initialize socket connection and room
   useEffect(() => {
-    socketRef.current = io(SOCKET_URL);
+    if (!user?._id || !contactId) {
+      console.log("Missing user or contact ID");
+      return;
+    }
 
-    // Join the chat room
-    socketRef.current.emit("join", chatId);
+    // Create room ID - for groups use groupId, for individual chats use sorted user IDs
+    let roomId;
+    if (isGroup) {
+      roomId = contactId; // For groups, contactId is the groupId
+    } else {
+      // For individual chats, create sorted room ID
+      const userIds = [user._id, contactId].sort();
+      roomId = `${userIds[0]}_${userIds[1]}`;
+    }
+    
+    roomIdRef.current = roomId;
+    console.log(`[SOCKET DEBUG] Setting up room: ${roomId}, isGroup: ${isGroup}`);
 
-    // Listen for new messages
-    socketRef.current.on("message", (newMessage: Message) => {
-      setMessages((prev) => [newMessage, ...prev]);
-    });
+    // Handle socket setup in an async function with proper cleanup
+    let cleanupListeners: (() => void) | null = null;
+    let connectionStateCleanup: (() => void) | null = null;
+    
+    const setupSocketConnection = async () => {
+      try {
+        console.log("[SOCKET DEBUG] Setting up socket connection for chat detail");
+        
+        // Get socket instance from service
+        socketRef.current = await socketService.initSocket();
+        
+        if (!socketRef.current) {
+          console.error("[SOCKET DEBUG] Failed to get socket instance");
+          Alert.alert(
+            "Connection Error", 
+            "Failed to establish connection. Messages may be delayed.",
+            [{ text: "Retry", onPress: setupSocketConnection }]
+          );
+          return;
+        }
+        
+        console.log(`[SOCKET DEBUG] Socket connected, joining room: ${roomId}`);
+        
+        // Join the chat room
+        socketService.joinChatRoom(roomId);
+        
+        // Setup connection state listeners
+        if (connectionStateCleanup) {
+          connectionStateCleanup();
+        }
+        
+        connectionStateCleanup = socketService.setupConnectionStateListeners(
+          // On connect
+          () => {
+            console.log("[SOCKET DEBUG] Socket reconnected, rejoining room and requesting missed messages");
+            socketService.joinChatRoom(roomId);
+            socketService.requestMissedMessages(roomId);
+          },
+          // On disconnect
+          (reason) => {
+            console.log(`[SOCKET DEBUG] Socket disconnected: ${reason}`);
+          }
+        );
+        
+        // Request missed messages immediately
+        socketService.requestMissedMessages(roomId);
+        
+        // Setup message handler - we need to store the handler function
+        // to be able to remove it later
+        const handleNewMessage = (newMessage: any) => {
+          console.log(`[SOCKET DEBUG] Received message: ${JSON.stringify(newMessage)}`);
+          
+          // Extract key information from the message
+          const messageId = newMessage._id;
+          const tempId = newMessage._tempId || newMessage.tempId;
+          const senderId = typeof newMessage.sender === 'object' ? newMessage.sender._id : newMessage.sender;
+          const receiverId = typeof newMessage.receiver === 'object' ? newMessage.receiver._id : newMessage.receiver;
+          const messageRoomId = newMessage.roomId || newMessage.groupId;
+          
+          // Validate message is for this conversation
+          let isValidMessage = false;
 
-    // Listen for message status updates
-    socketRef.current.on(
-      "messageStatus",
-      (data: { messageId: string; status: string }) => {
-        setMessages((prev) =>
-          prev.map((msg) =>
-            msg._id === data.messageId ? { ...msg, status: data.status } : msg
-          )
+          // For groups, check if message's groupId matches this group
+          if (isGroup && newMessage.groupId && newMessage.groupId === contactId) {
+            isValidMessage = true;
+          }
+          // For direct chat, check if message is for this conversation
+          else if (!isGroup) {
+            // Check direct roomId match
+            if (messageRoomId && messageRoomId === roomId) {
+              isValidMessage = true;
+            }
+            // Check sender/receiver match for this conversation
+            else if ((senderId === user._id && receiverId === contactId) || 
+                    (senderId === contactId && receiverId === user._id)) {
+              isValidMessage = true;
+            }
+            // Check if IDs match room pattern
+            else {
+              const messageUserIds = [senderId, receiverId].sort().join('_');
+              if (messageUserIds === roomId) {
+                isValidMessage = true;
+              }
+            }
+          }
+            
+          if (!isValidMessage) {
+            console.log(`[SOCKET DEBUG] Message not for this room, ignoring. Message room info: ${senderId}_${receiverId} vs ${roomId}`);
+            return;
+          }
+          
+          // Log message details
+          console.log(`[SOCKET DEBUG] Processing message: ID=${messageId}, TempID=${tempId}, Sender=${senderId}`);
+          
+          // Check if this message has already been processed
+          if (socketService.isMessageReceived(messageId, tempId)) {
+            console.log(`[SOCKET DEBUG] Ignoring duplicate message: ${messageId}/${tempId}`);
+            return;
+          }
+          
+          // Mark message as received
+          socketService.markMessageReceived(messageId, tempId);
+          
+          // Normalize the message format for UI
+          const normalizedMessage: Message = {
+            _id: messageId || `temp-${Date.now()}`,
+            content: newMessage.content || "",
+            type: newMessage.type || "text",
+            sender: {
+              _id: typeof newMessage.sender === 'object' ? newMessage.sender._id : newMessage.sender,
+              name: typeof newMessage.sender === 'object' ? 
+                (newMessage.sender.name || `${newMessage.sender.firstName || ""} ${newMessage.sender.lastName || ""}`.trim()) : 
+                (senderId === user._id ? (user?.name || "You") : chatName),
+              avt: typeof newMessage.sender === 'object' ? 
+                (newMessage.sender.avt || newMessage.sender.avatar || "") : 
+                (senderId === user._id ? (user?.avt || "") : contactAvatar)
+            },
+            createdAt: newMessage.createdAt || new Date().toISOString(),
+            reactions: newMessage.reactions || {},
+            unsent: newMessage.unsent || false,
+            fileUrl: newMessage.fileUrl || newMessage.file?.url || "",
+            fileName: newMessage.fileName || newMessage.file?.name || "",
+            roomId: newMessage.roomId || roomId
+          };
+          
+          console.log(`[SOCKET DEBUG] Adding/updating message in UI: ${normalizedMessage._id}`);
+          
+          // Update messages state efficiently
+          setMessages(prevMessages => {
+            // Check for duplicates in current state
+            if (prevMessages.some(msg => 
+              msg._id === messageId || 
+              (tempId && (msg._id === tempId || 
+                (msg._id.startsWith('temp-') && tempId.startsWith('temp-') && msg._id === tempId)))
+            )) {
+              console.log(`[SOCKET DEBUG] Message already in state: ${messageId}`);
+              
+              // If message exists but as a temp, replace it with confirmed version
+              if (tempId && tempId.startsWith('temp-')) {
+                return prevMessages.map(msg => 
+                  msg._id === tempId ? normalizedMessage : msg
+                );
+              }
+              
+              return prevMessages; // No change needed
+            }
+            
+            // Find and replace temp message or add new message
+            if (tempId && tempId.startsWith('temp-')) {
+              // This is confirming a message we sent
+              const tempIndex = prevMessages.findIndex(m => m._id === tempId);
+              
+              if (tempIndex !== -1) {
+                console.log(`[SOCKET DEBUG] Replacing temp message: ${tempId}`);
+                // Replace temp message with confirmed one
+                const updatedMessages = [...prevMessages];
+                updatedMessages[tempIndex] = normalizedMessage;
+                return updatedMessages;
+              }
+            }
+            
+            // This is a new message, add it to the top
+            console.log(`[SOCKET DEBUG] Adding new message to UI: ${normalizedMessage._id}`);
+            return [normalizedMessage, ...prevMessages];
+          });
+          
+          // Mark as read if message is from the other person
+          if (senderId !== user._id) {
+            console.log(`[SOCKET DEBUG] Marking message as read: ${messageId}`);
+            socketService.markMessageAsRead({
+              messageId: messageId,
+              sender: senderId,
+              receiver: user._id,
+            });
+          }
+        };
+        
+        // Remove any existing event listeners first to prevent duplicates
+        if (socketRef.current) {
+          socketRef.current.off("receiveMessage");
+        }
+        
+        // Add message handler
+        socketRef.current.on("receiveMessage", handleNewMessage);
+        console.log("[SOCKET DEBUG] Added receiveMessage event listener");
+        
+        // Setup other event handlers
+        socketRef.current.on("messageStatusUpdate", (data: { messageId: string; status: string }) => {
+          console.log(`[SOCKET DEBUG] Message status update: ${data.messageId} -> ${data.status}`);
+          setMessages(prev =>
+            prev.map(msg =>
+              msg._id === data.messageId ? { ...msg, status: data.status } : msg
+            )
+          );
+        });
+        
+        socketRef.current.on("messageReaction", (data: { messageId: string; userId: string; emoji: string }) => {
+          console.log(`[SOCKET DEBUG] Message reaction: ${data.messageId} -> ${data.emoji}`);
+          setMessages(prev =>
+            prev.map(msg =>
+              msg._id === data.messageId
+                ? {
+                    ...msg,
+                    reactions: {
+                      ...(msg.reactions || {}),
+                      [data.userId]: data.emoji,
+                    },
+                  }
+                : msg
+            )
+          );
+        });
+        
+        socketRef.current.on("userTyping", (data: { userId: string }) => {
+          if (!isGroup && data.userId === contactId) {
+            setIsTyping(true);
+          }
+        });
+        
+        socketRef.current.on("userStoppedTyping", (data: { userId: string }) => {
+          if (!isGroup && data.userId === contactId) {
+            setIsTyping(false);
+          }
+        });
+        
+        socketRef.current.on("messageUnsent", (data: { messageId: string }) => {
+          console.log(`[SOCKET DEBUG] Message unsent: ${data.messageId}`);
+          setMessages(prev =>
+            prev.map(msg =>
+              msg._id === data.messageId
+                ? { ...msg, content: "This message has been unsent", unsent: true }
+                : msg
+            )
+          );
+        });
+
+        // Store cleanup function
+        cleanupListeners = () => {
+          if (socketRef.current) {
+            console.log("[SOCKET DEBUG] Cleaning up socket event listeners");
+            socketRef.current.off("receiveMessage", handleNewMessage);
+            socketRef.current.off("messageStatusUpdate");
+            socketRef.current.off("messageReaction");
+            socketRef.current.off("userTyping");
+            socketRef.current.off("userStoppedTyping");
+            socketRef.current.off("messageUnsent");
+          }
+        };
+      } catch (error) {
+        console.error("[SOCKET DEBUG] Socket setup error:", error);
+        Alert.alert(
+          "Connection Error", 
+          "Failed to establish connection. Messages may be delayed.",
+          [{ text: "Retry", onPress: setupSocketConnection }]
         );
       }
-    );
-
-    // Listen for message reactions
-    socketRef.current.on(
-      "messageReaction",
-      (data: { messageId: string; userId: string; emoji: string }) => {
-        setMessages((prev) =>
-          prev.map((msg) =>
-            msg._id === data.messageId
-              ? {
-                  ...msg,
-                  reactions: {
-                    ...(msg.reactions || {}),
-                    [data.userId]: data.emoji,
-                  },
-                }
-              : msg
-          )
-        );
-      }
-    );
-
-    // Clean up on unmount
-    return () => {
-      socketRef.current.disconnect();
     };
-  }, []);
+    
+    // Call the setup function
+    setupSocketConnection();
+    
+    // Return cleanup function that uses the stored reference
+    return () => {
+      if (cleanupListeners) {
+        cleanupListeners();
+      }
+      if (connectionStateCleanup) {
+        connectionStateCleanup();
+      }
+    };
+  }, [user?._id, contactId, chatName, contactAvatar, isGroup]);
 
-  // Load initial messages
+  // Load group info if it's a group chat
+  useEffect(() => {
+    if (isGroup && contactId) {
+      const loadGroupInfo = async () => {
+        try {
+          const token = await AsyncStorage.getItem('token');
+          
+          if (!token) {
+            console.error("No auth token available for loading group info");
+            return;
+          }
+          
+          const response = await axios.get(`${API_URL}/api/group/${contactId}`, {
+            headers: {
+              'Authorization': `Bearer ${token}`
+            }
+          });
+          
+          if (response.data) {
+            setGroupInfo(response.data);
+            setGroupMembers(response.data.members || []);
+          }
+        } catch (error) {
+          console.error("Failed to load group info:", error);
+        }
+      };
+      
+      loadGroupInfo();
+    }
+  }, [isGroup, contactId]);
+
+  // Load initial messages with optimized approach
   useEffect(() => {
     const loadMessages = async () => {
       try {
+        setLoading(true);
+        
         // Get token from storage
         const token = await AsyncStorage.getItem('token');
         
@@ -135,93 +423,113 @@ const ChatDetailScreen = () => {
           return;
         }
 
-        // Try multiple API endpoints and formats that the server might use
-        let messages = [];
-        let endpoint = '';
+        let messagesData = [];
         let response;
         
-        // First try the specific chat ID endpoint
-        try {
-          endpoint = `${API_URL}/api/chat/${chatId}/messages`;
-          console.log(`Trying to load messages from: ${endpoint}`);
-          response = await axios.get(endpoint, {
-            headers: {
-              'Authorization': `Bearer ${token}`
-            }
-          });
-          if (response.data && (Array.isArray(response.data) || response.data.messages)) {
-            messages = Array.isArray(response.data) ? response.data : response.data.messages;
-            console.log(`Successfully loaded ${messages.length} messages from chat ID endpoint`);
-          }
-        } catch (err) {
-          console.log(`First endpoint failed: ${err.message}`);
-        }
-        
-        // If first attempt failed, try the user-to-user endpoint
-        if (messages.length === 0) {
+        // For group chats, use group messages endpoint
+        if (isGroup) {
           try {
-            const sortedUserIds = [user?._id, contactId].sort();
-            endpoint = `${API_URL}/api/chat/messages/${sortedUserIds[0]}/${sortedUserIds[1]}`;
-            console.log(`Trying alternate endpoint: ${endpoint}`);
-            response = await axios.get(endpoint, {
+            response = await axios.get(`${API_URL}/api/group/${contactId}/messages`, {
               headers: {
                 'Authorization': `Bearer ${token}`
               }
             });
-            if (response.data && (Array.isArray(response.data) || response.data.messages)) {
-              messages = Array.isArray(response.data) ? response.data : response.data.messages;
-              console.log(`Successfully loaded ${messages.length} messages from user-to-user endpoint`);
+            
+            if (response.data) {
+              messagesData = Array.isArray(response.data) ? response.data : 
+                (response.data.messages ? response.data.messages : []);
+                
+              console.log(`Loaded ${messagesData.length} group messages`);
             }
           } catch (err) {
-            console.log(`Second endpoint failed: ${err.message}`);
+            console.log("Group messages endpoint failed:", err.message);
           }
-        }
-        
-        // Last attempt - try room-based endpoint
-        if (messages.length === 0) {
-          try {
-            const sortedUserIds = [user?._id, contactId].sort();
-            const roomId = `${sortedUserIds[0]}_${sortedUserIds[1]}`;
-            endpoint = `${API_URL}/api/chat/room/${roomId}/messages`;
-            console.log(`Trying room endpoint: ${endpoint}`);
-            response = await axios.get(endpoint, {
-              headers: {
-                'Authorization': `Bearer ${token}`
-              }
-            });
-            if (response.data && (Array.isArray(response.data) || response.data.messages)) {
-              messages = Array.isArray(response.data) ? response.data : response.data.messages;
-              console.log(`Successfully loaded ${messages.length} messages from room endpoint`);
-            }
-          } catch (err) {
-            console.log(`Third endpoint failed: ${err.message}`);
-          }
-        }
-        
-        if (messages.length === 0) {
-          console.log("All message loading attempts failed");
-          // For new chats, this might be normal - not showing an error
         } else {
-          console.log(`Loaded ${messages.length} messages`);
+          // For individual chats, use existing logic
+          // Create a consistent room ID based on sorted user IDs
+          const sortedUserIds = [user?._id, contactId].sort();
+          const roomId = `${sortedUserIds[0]}_${sortedUserIds[1]}`;
+          
+          // Try to get messages using direct endpoint first (fastest)
+          try {
+            // Use endpoint with a timeout to prevent long waits
+            const timeoutPromise = new Promise((_, reject) => 
+              setTimeout(() => reject(new Error("Loading messages timed out")), 3000)
+            );
+            
+            const fetchPromise = axios.get(`${API_URL}/api/chat/messages/${sortedUserIds[0]}/${sortedUserIds[1]}`, {
+              headers: {
+                'Authorization': `Bearer ${token}`
+              }
+            });
+            
+            response = await Promise.race([fetchPromise, timeoutPromise]);
+            
+            if (response.data) {
+              // Handle array or nested format
+              messagesData = Array.isArray(response.data) ? response.data : 
+                (response.data.messages ? response.data.messages : []);
+                
+              console.log(`Loaded ${messagesData.length} messages from direct endpoint`);
+            }
+          } catch (err) {
+            console.log("Direct messages endpoint failed:", err.message);
+            
+            // If direct endpoint failed, try room-based endpoint as backup
+            try {
+              response = await axios.get(`${API_URL}/api/chat/room/${roomId}/messages`, {
+                headers: {
+                  'Authorization': `Bearer ${token}`
+                }
+              });
+              
+              if (response.data) {
+                messagesData = Array.isArray(response.data) ? response.data : 
+                  (response.data.messages ? response.data.messages : []);
+                  
+                console.log(`Loaded ${messagesData.length} messages from room endpoint`);
+              }
+            } catch (roomErr) {
+              console.log("Room messages endpoint failed:", roomErr.message);
+              
+              // Last attempt - try with chat ID if provided
+              if (chatId) {
+                try {
+                  response = await axios.get(`${API_URL}/api/chat/${chatId}/messages`, {
+                    headers: {
+                      'Authorization': `Bearer ${token}`
+                    }
+                  });
+                  
+                  if (response.data) {
+                    messagesData = Array.isArray(response.data) ? response.data : 
+                      (response.data.messages ? response.data.messages : []);
+                      
+                    console.log(`Loaded ${messagesData.length} messages from chat ID endpoint`);
+                  }
+                } catch (chatErr) {
+                  console.log("Chat ID messages endpoint failed:", chatErr.message);
+                }
+              }
+            }
+          }
         }
         
-        // Transform messages to match the expected format if needed
-        const formattedMessages = messages.map((msg: any) => {
-          // Handle different sender formats
+        // Transform messages to consistent format
+        const formattedMessages = messagesData.map((msg: any) => {
+          // Normalize sender format
           let sender = msg.sender || {};
           if (typeof sender === 'string') {
-            // If sender is just an ID string
             sender = {
               _id: sender,
-              name: sender === user?._id ? (user?.name || "You") : "User",
-              avt: ""
+              name: sender === user?._id ? (user?.name || "You") : chatName,
+              avt: sender === user?._id ? (user?.avt || "") : contactAvatar
             };
           } else if (!sender._id && msg.senderId) {
-            // If we have a senderId property but no sender object
             sender = {
               _id: msg.senderId,
-              name: msg.senderId === user?._id ? (user?.name || "You") : "User",
-              avt: ""
+              name: msg.senderId === user?._id ? (user?.name || "You") : chatName,
+              avt: msg.senderId === user?._id ? (user?.avt || "") : contactAvatar
             };
           }
           
@@ -242,22 +550,55 @@ const ChatDetailScreen = () => {
           };
         });
         
-        // Sort in descending order (newest first) for inverted FlatList
+        // Sort newest first for FlatList
         setMessages(formattedMessages.reverse());
       } catch (error: any) {
         console.error("Failed to load messages:", error);
         Alert.alert(
           "Error", 
-          error.response?.data?.message || "Failed to load messages. Please try again."
+          error.response?.data?.message || "Failed to load messages. Please try again.",
+          [{ text: "Retry", onPress: loadMessages }]
         );
       } finally {
         setLoading(false);
       }
     };
 
-    loadMessages();
-  }, [user?._id, contactId]);
+    if (user?._id && contactId) {
+      loadMessages();
+    }
+  }, [user?._id, contactId, chatId, chatName, contactAvatar, isGroup]);
 
+  // Optimize typing indicator with debounce
+  const handleTyping = (text: string) => {
+    setMessageText(text);
+    
+    // Send typing indicator with debounce (only for direct chats)
+    if (user?._id && contactId && !isGroup) {
+      // Clear any existing timeout
+      if (typingTimeout) {
+        clearTimeout(typingTimeout);
+      }
+      
+      // Send typing status
+      socketService.sendTypingStatus({
+        sender: user._id,
+        receiver: contactId
+      });
+      
+      // Set timeout to stop typing
+      const timeout = setTimeout(() => {
+        socketService.sendStopTypingStatus({
+          sender: user._id,
+          receiver: contactId
+        });
+      }, 1000); // Reduce from 2000ms to 1000ms for faster feedback
+      
+      setTypingTimeout(timeout);
+    }
+  };
+
+  // Improved sendMessage function with better error handling
   const sendMessage = async (
     content: string,
     type = "text",
@@ -279,15 +620,17 @@ const ChatDetailScreen = () => {
         return;
       }
 
-      const sortedUserIds = [user?._id, contactId].sort();
-      const roomId = `${sortedUserIds[0]}_${sortedUserIds[1]}`;
+      // Get room ID from ref to ensure consistency
+      const roomId = roomIdRef.current || (isGroup ? 
+        contactId : 
+        `${[user?._id, contactId].sort().join('_')}`);
 
       // Create a temporary message ID to track this message
-      const tempMessageId = `temp-${Date.now()}`;
+      const tempId = `temp-${Date.now()}`;
 
       // Add temporary message to UI immediately for better UX
       const tempMessage: Message = {
-        _id: tempMessageId,
+        _id: tempId,
         content,
         type: type as "text" | "image" | "video" | "audio" | "file",
         sender: {
@@ -299,81 +642,95 @@ const ChatDetailScreen = () => {
         unsent: false,
         reactions: {},
         ...(fileUrl && { fileUrl }),
-        ...(fileName && { fileName })
+        ...(fileName && { fileName }),
+        roomId // Add roomId to temp message
       };
 
       // Add temp message to start of the messages array
       setMessages(prevMessages => [tempMessage, ...prevMessages]);
 
-      // Prepare message data based on server expectations
-      const messageData = {
-        roomId,
-        content,
-        type,
-        receiver: contactId,
-        ...(replyingTo && { replyToId: replyingTo._id }),
-        ...(fileUrl && { fileUrl }),
-        ...(fileName && { fileName }),
-        ...(fileSize > 0 && { fileSize }),
-      };
-
-      console.log("Sending message:", type);
-      
-      // Try multiple API endpoints that the server might use
-      let response;
-      let sent = false;
-      
-      // First try standard messages endpoint
-      try {
-        response = await axios.post(
-          `${API_URL}/api/chat/messages`,
-          messageData,
-          {
-            headers: {
-              'Authorization': `Bearer ${token}`,
-              'Content-Type': 'application/json'
-            }
-          }
-        );
-        sent = true;
-        console.log("Message sent successfully via standard endpoint");
-      } catch (err) {
-        console.log("First message endpoint failed:", err.message);
-      }
-      
-      // Try alternate endpoint if first one failed
-      if (!sent) {
-        try {
-          response = await axios.post(
-            `${API_URL}/api/chat/send`,
-            messageData,
-            {
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json'
-              }
-            }
-          );
-          sent = true;
-          console.log("Message sent successfully via alternate endpoint");
-        } catch (err) {
-          console.log("Second message endpoint failed:", err.message);
+      // Send message via socket first for fastest delivery
+      let socketSuccess = false;
+      if (user?._id && socketRef.current?.connected) {
+        // Send stop typing status if not a group
+        if (!isGroup) {
+          socketService.sendStopTypingStatus({
+            sender: user._id,
+            receiver: contactId
+          });
         }
+        
+        // Send message via socket
+        if (isGroup) {
+          // For group messages
+          socketSuccess = socketService.sendGroupMessage({
+            sender: user._id,
+            groupId: contactId,
+            content,
+            tempId,
+            type,
+            roomId,
+            ...(replyingTo && { replyToId: replyingTo._id }),
+            ...(fileUrl && { fileUrl }),
+            ...(fileName && { fileName }),
+            ...(fileSize > 0 && { fileSize }),
+          });
+        } else {
+          // For direct messages
+          socketSuccess = socketService.sendMessage({
+            sender: user._id,
+            receiver: contactId,
+            content,
+            tempId,
+            type,
+            roomId,
+            ...(replyingTo && { replyToId: replyingTo._id }),
+            ...(fileUrl && { fileUrl }),
+            ...(fileName && { fileName }),
+            ...(fileSize > 0 && { fileSize }),
+          });
+        }
+        
+        console.log("Socket message send attempt:", socketSuccess ? "SUCCESS" : "FAILED");
       }
-      
-      // Final attempt with room-specific endpoint
-      if (!sent) {
+
+      // If socket send failed or socket is not connected, use REST API immediately
+      if (!socketSuccess) {
+        console.log("Using REST API to send message");
         try {
-          response = await axios.post(
-            `${API_URL}/api/chat/room/${roomId}/messages`,
-            {
+          let url, data;
+          
+          if (isGroup) {
+            // Group message endpoint
+            url = `${API_URL}/api/group/message`;
+            data = {
+              roomId,
+              groupId: contactId,
               content,
               type,
               ...(replyingTo && { replyToId: replyingTo._id }),
               ...(fileUrl && { fileUrl }),
               ...(fileName && { fileName }),
               ...(fileSize > 0 && { fileSize }),
-            },
+            };
+          } else {
+            // Direct message endpoint
+            url = `${API_URL}/api/chat/messages`;
+            data = {
+              roomId,
+              content,
+              type,
+              receiver: contactId,
+              ...(replyingTo && { replyToId: replyingTo._id }),
+              ...(fileUrl && { fileUrl }),
+              ...(fileName && { fileName }),
+              ...(fileSize > 0 && { fileSize }),
+            };
+          }
+          
+          const response = await axios.post(
+            url,
+            data,
             {
               headers: {
                 'Authorization': `Bearer ${token}`,
@@ -381,54 +738,39 @@ const ChatDetailScreen = () => {
               }
             }
           );
-          sent = true;
-          console.log("Message sent successfully via room endpoint");
-        } catch (err) {
-          console.log("Third message endpoint failed:", err.message);
-          throw err; // Re-throw to handle in the catch block
+          
+          // If API send was successful, update the temp message with the real ID
+          if (response.data && response.data._id) {
+            setMessages(prevMessages => 
+              prevMessages.map(msg => 
+                msg._id === tempId ? 
+                { ...msg, _id: response.data._id } : 
+                msg
+              )
+            );
+          }
+          
+          console.log("REST API message sent successfully");
+        } catch (apiError) {
+          console.error("API message send failed:", apiError);
+          // Keep the temp message to show something was sent
         }
       }
 
       // Clear input after sending
       setMessageText("");
       setReplyingTo(null);
-
-      if (sent && response?.data) {
-        // Replace the temporary message with the real one from the server
-        const serverMessage = response.data;
-        
-        setMessages(prevMessages => prevMessages.map(msg => 
-          msg._id === tempMessageId ? {
-            _id: serverMessage._id || serverMessage.id || tempMessageId,
-            content: serverMessage.content || content,
-            type: (serverMessage.type || type) as "text" | "image" | "video" | "audio" | "file",
-            sender: {
-              _id: user?._id || '',
-              name: user?.name || 'You',
-              avt: user?.avt || ''
-            },
-            createdAt: serverMessage.createdAt || new Date().toISOString(),
-            unsent: false,
-            reactions: {},
-            ...(serverMessage.fileUrl && { fileUrl: serverMessage.fileUrl }),
-            ...(serverMessage.fileName && { fileName: serverMessage.fileName })
-          } : msg
-        ));
-
-        // Emit message via socket if connected
-        if (socketRef.current) {
-          socketRef.current.emit("sendMessage", {
-            roomId,
-            message: serverMessage,
-          });
-          console.log("Message emitted to socket");
-        }
-      }
     } catch (error: any) {
       console.error("Failed to send message:", error);
       
-      // Remove the temporary message since it failed to send
-      setMessages(prevMessages => prevMessages.filter(msg => !msg._id.startsWith('temp-')));
+      // Don't remove the temporary message, just mark it as failed
+      setMessages(prevMessages => 
+        prevMessages.map(msg => 
+          msg._id.startsWith('temp-') ? 
+          { ...msg, failed: true } : 
+          msg
+        )
+      );
       
       Alert.alert(
         "Error", 
@@ -631,39 +973,46 @@ const ChatDetailScreen = () => {
   };
 
   const handleReaction = async (messageId: string, emoji: string) => {
-    try {
-      await axios.post(`${API_URL}/api/chat/message/${messageId}/reaction`, {
-        emoji,
-      });
-
-      // Socket emit will handle the update
-      socketRef.current.emit("react", { messageId, emoji, roomId: chatId });
-    } catch (error) {
-      console.error("Failed to add reaction:", error);
-      Alert.alert("Error", "Failed to add reaction. Please try again.");
-    }
+    if (!user?._id) return;
+    
+    socketService.addReaction({
+      messageId,
+      userId: user._id,
+      emoji
+    });
   };
 
   const handleUnsendMessage = async (message: Message) => {
+    if (!user?._id) return;
+    
     try {
-      await axios.put(`${API_URL}/api/chat/message/${message._id}/unsend`, {
-        forEveryone: true,
-      });
-
-      // Update local messages
+      // Update UI first
       setMessages((prev) =>
         prev.map((msg) =>
           msg._id === message._id
-            ? { ...msg, unsent: true, content: "This message has been unsent" }
+            ? { ...msg, content: "Tin nhắn đã bị thu hồi", unsent: true }
             : msg
         )
       );
-
-      // Socket emit will notify other users
-      socketRef.current.emit("unsendMessage", {
+      
+      // Then send via socket
+      socketService.unsendMessage({
         messageId: message._id,
-        roomId: chatId,
+        senderId: user._id,
+        receiverId: contactId
       });
+      
+      // Backup API call
+      const token = await AsyncStorage.getItem('token');
+      await axios.put(
+        `${API_URL}/api/chat/messages/${message._id}/unsend`,
+        { forEveryone: true },
+        {
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        }
+      );
     } catch (error) {
       console.error("Failed to unsend message:", error);
       Alert.alert("Error", "Failed to unsend message. Please try again.");
@@ -673,6 +1022,7 @@ const ChatDetailScreen = () => {
   const renderMessage = ({ item }: { item: Message }) => {
     const isMine = item.sender._id === user?._id;
     const formattedTime = moment(item.createdAt).format("HH:mm");
+    const isFailed = (item as any).failed;
 
     return (
       <View
@@ -695,7 +1045,11 @@ const ChatDetailScreen = () => {
         )}
 
         <View
-          style={[styles.messageBubble, isMine ? styles.myMessageBubble : {}]}
+          style={[
+            styles.messageBubble, 
+            isMine ? styles.myMessageBubble : {},
+            isFailed ? styles.failedMessage : {}
+          ]}
         >
           {item.replyTo && (
             <View style={styles.replyContainer}>
@@ -736,7 +1090,10 @@ const ChatDetailScreen = () => {
             </View>
           ) : null}
 
-          <Text style={styles.messageTime}>{formattedTime}</Text>
+          <Text style={styles.messageTime}>
+            {formattedTime}
+            {isFailed && " (Failed)"}
+          </Text>
 
           {Object.keys(item.reactions || {}).length > 0 && (
             <View style={styles.reactionsContainer}>
@@ -780,6 +1137,17 @@ const ChatDetailScreen = () => {
     );
   };
 
+  // Show group info
+  const showGroupInfo = () => {
+    if (isGroup && groupInfo) {
+      navigation.navigate('GroupInfo', {
+        groupId: contactId,
+        groupName: chatName,
+        groupAvatar: contactAvatar
+      });
+    }
+  };
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
@@ -790,29 +1158,50 @@ const ChatDetailScreen = () => {
           <Ionicons name="arrow-back" size={24} color="#2196F3" />
         </TouchableOpacity>
 
-        <Image
-          source={{
-            uri:
-              contactAvatar ||
-              `https://ui-avatars.com/api/?name=${encodeURIComponent(
-                chatName
-              )}`,
-          }}
-          style={styles.headerAvatar}
-        />
+        <TouchableOpacity 
+          style={styles.headerMain}
+          onPress={isGroup ? showGroupInfo : undefined}
+        >
+          <Image
+            source={{
+              uri:
+                contactAvatar ||
+                `https://ui-avatars.com/api/?name=${encodeURIComponent(
+                  chatName
+                )}`,
+            }}
+            style={styles.headerAvatar}
+          />
 
-        <View style={styles.headerInfo}>
-          <Text style={styles.headerName}>{chatName}</Text>
-          <Text style={styles.headerStatus}>Online</Text>
-        </View>
-
-        <TouchableOpacity style={styles.headerButton}>
-          <Ionicons name="call-outline" size={24} color="#2196F3" />
+          <View style={styles.headerInfo}>
+            <Text style={styles.headerName}>{chatName}</Text>
+            {isGroup ? (
+              <Text style={styles.headerStatus}>
+                {groupMembers.length} members
+              </Text>
+            ) : (
+              <Text style={styles.headerStatus}>Online</Text>
+            )}
+          </View>
         </TouchableOpacity>
 
-        <TouchableOpacity style={styles.headerButton}>
-          <Ionicons name="videocam-outline" size={24} color="#2196F3" />
-        </TouchableOpacity>
+        {!isGroup && (
+          <>
+            <TouchableOpacity style={styles.headerButton}>
+              <Ionicons name="call-outline" size={24} color="#2196F3" />
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.headerButton}>
+              <Ionicons name="videocam-outline" size={24} color="#2196F3" />
+            </TouchableOpacity>
+          </>
+        )}
+
+        {isGroup && (
+          <TouchableOpacity style={styles.headerButton} onPress={showGroupInfo}>
+            <Ionicons name="information-circle-outline" size={24} color="#2196F3" />
+          </TouchableOpacity>
+        )}
       </View>
 
       <KeyboardAvoidingView
@@ -836,6 +1225,12 @@ const ChatDetailScreen = () => {
             contentContainerStyle={styles.messagesListContent}
             inverted
           />
+        )}
+
+        {isTyping && (
+          <View style={styles.typingIndicator}>
+            <Text style={styles.typingText}>{chatName} đang nhập...</Text>
+          </View>
         )}
 
         {replyingTo && (
@@ -873,7 +1268,7 @@ const ChatDetailScreen = () => {
             style={styles.input}
             placeholder="Type a message..."
             value={messageText}
-            onChangeText={setMessageText}
+            onChangeText={handleTyping}
             multiline
           />
 
@@ -925,6 +1320,10 @@ const styles = StyleSheet.create({
   },
   backButton: {
     padding: 5,
+  },
+  headerMain: {
+    flexDirection: "row",
+    alignItems: "center",
   },
   headerAvatar: {
     width: 40,
@@ -1103,6 +1502,22 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
+  },
+  typingIndicator: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 10,
+    backgroundColor: "#fff",
+    borderTopWidth: 1,
+    borderTopColor: "#eee",
+  },
+  typingText: {
+    fontSize: 12,
+    color: "#666",
+  },
+  failedMessage: {
+    borderColor: '#ff6b6b',
+    backgroundColor: '#ffeeee',
   },
 });
 

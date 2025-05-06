@@ -12,17 +12,11 @@ if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
 
-// Cấu hình multer để lưu trữ file
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, uploadDir);
-  },
-  filename: function (req, file, cb) {
-    // Tạo tên file duy nhất
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    const ext = path.extname(file.originalname);
-    cb(null, uniqueSuffix + ext);
-  },
+// Cấu hình multer để lưu trữ file tạm thời trong bộ nhớ
+const storage = multer.memoryStorage();
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 } // Giới hạn kích thước file 50MB
 });
 
 // Tạo filter để kiểm tra loại file
@@ -54,7 +48,7 @@ const fileFilter = (req, file, cb) => {
 };
 
 // Giới hạn kích thước file là 50MB
-const upload = multer({
+const uploadMulter = multer({
   storage,
   fileFilter,
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
@@ -65,19 +59,10 @@ const upload = multer({
 router.get("/recent", authMiddleware, chatController.getRecentChats);
 
 // Route để upload file
-router.post(
-  "/upload",
-  authMiddleware,
-  upload.single("file"),
-  chatController.uploadFile
-);
+router.post("/upload", upload.single("file"), chatController.uploadFile);
 
 // Route to upload image directly to Cloudinary
-router.post(
-  "/upload-cloudinary",
-  authMiddleware,
-  chatController.uploadToCloudinary
-);
+router.post("/upload-image", authMiddleware, chatController.uploadToCloudinary);
 
 // Development route for testing Cloudinary uploads (no auth required)
 router.post(
@@ -86,47 +71,40 @@ router.post(
 );
 
 // Route để truy cập media
-router.get("/media/:filename", chatController.getMedia);
+router.get("/media/:fileId", chatController.getMedia);
 router.delete("/media/:fileId", authMiddleware, chatController.deleteMedia);
 
 // Route để lấy tin nhắn giữa 2 người dùng - đặt trước route chung
-router.get(
-  "/messages/:userId1/:userId2",
-  authMiddleware,
-  chatController.getMessagesBetweenUsers
-);
+router.get("/messages/:userId1/:userId2", authMiddleware, chatController.getMessagesBetweenUsers);
 
 // Route để lấy tin nhắn trong một phòng
-router.get("/messages/:roomId", authMiddleware, chatController.getMessages);
+router.get("/:roomId/messages", authMiddleware, chatController.getMessages);
 
 // Route để lưu tin nhắn
 router.post("/messages", authMiddleware, chatController.saveMessageRoute);
 
 // Route để thu hồi tin nhắn
-router.put(
-  "/message/:messageId/unsend",
-  authMiddleware,
-  chatController.unsendMessage
-);
+router.put("/messages/:messageId/unsend", authMiddleware, chatController.unsendMessage);
 
 // Route để xóa cuộc trò chuyện
-router.delete(
-  "/conversation/:userId1/:userId2",
-  authMiddleware,
-  chatController.deleteConversation
-);
+router.delete("/conversation/:userId1/:userId2", authMiddleware, chatController.deleteConversation);
 
 // Route xử lý phản ứng tin nhắn
-router.post(
-  "/message/:messageId/reaction",
-  authMiddleware,
-  chatController.addReaction
-);
-router.delete(
-  "/message/:messageId/reaction",
-  authMiddleware,
-  chatController.removeReaction
-);
+router.post("/messages/:messageId/reaction", authMiddleware, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const { emoji } = req.body;
+    const userId = req.user._id;
+
+    await chatController.addReaction(messageId, userId, emoji);
+
+    res.status(200).json({ message: "Reaction added successfully" });
+  } catch (error) {
+    console.error("Error adding reaction:", error);
+    res.status(500).json({ message: "Error adding reaction", error: error.message });
+  }
+});
+router.delete("/messages/:messageId/reaction", authMiddleware, chatController.removeReaction);
 
 // Endpoint kiểm tra trạng thái cuộc trò chuyện
 router.get("/status/:userId", authMiddleware, (req, res) => {

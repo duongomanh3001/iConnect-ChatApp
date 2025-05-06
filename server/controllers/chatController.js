@@ -473,7 +473,7 @@ const deleteConversation = async (req, res) => {
 // Hàm để lấy danh sách cuộc trò chuyện gần đây
 const getRecentChats = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user._id;
 
     // Tìm tất cả tin nhắn mà người dùng này có liên quan
     const results = await Message.aggregate([
@@ -504,54 +504,83 @@ const getRecentChats = async (req, res) => {
     // Lấy danh sách người dùng liên quan đến các cuộc trò chuyện
     const chatList = [];
     for (const chat of results) {
-      // Xác định ID người dùng khác trong cuộc trò chuyện
-      const roomUsers = chat._id.split("_");
-      const otherUserId = roomUsers[0] === userId ? roomUsers[1] : roomUsers[0];
+      try {
+        // Xác định ID người dùng khác trong cuộc trò chuyện
+        let otherUserId;
+        
+        // Check if roomId follows the expected format (user1_user2)
+        if (chat._id && chat._id.includes('_')) {
+          const roomUsers = chat._id.split("_");
+          otherUserId = roomUsers[0] === userId.toString() ? roomUsers[1] : roomUsers[0];
+        } else if (chat.lastMessage && chat.lastMessage.receiver) {
+          // If roomId doesn't follow the expected pattern, use the receiver or sender from lastMessage
+          otherUserId = chat.lastMessage.sender.toString() === userId.toString() 
+            ? chat.lastMessage.receiver.toString() 
+            : chat.lastMessage.sender.toString();
+        } else {
+          console.log(`Skipping chat with invalid roomId format: ${chat._id}`);
+          continue;
+        }
 
-      // Lấy thông tin người dùng
-      const otherUser = await User.findById(otherUserId).select(
-        "name avt email"
-      );
+        // Lấy thông tin người dùng
+        const otherUser = await User.findById(otherUserId).select(
+          "name avt email"
+        );
 
-      if (otherUser) {
-        // Đếm số tin nhắn chưa đọc
-        const unreadCount = await Message.countDocuments({
-          roomId: chat._id,
-          receiver: userId,
-          isRead: false,
-          isDeleted: { $ne: true },
-        });
+        if (otherUser) {
+          // Đếm số tin nhắn chưa đọc
+          const unreadCount = await Message.countDocuments({
+            roomId: chat._id,
+            receiver: userId,
+            isRead: false,
+            isDeleted: { $ne: true },
+          });
 
-        // Tạo đối tượng chat
-        chatList.push({
-          id: chat._id,
-          isGroup: false,
-          participants: [
-            {
-              id: userId,
-              firstName: req.user.name.split(" ")[0],
-              lastName: req.user.name.split(" ")[1] || "",
-              avatar: req.user.avt,
+          // Split name safely
+          const nameArray = otherUser.name ? otherUser.name.split(" ") : ["User"];
+          const firstName = nameArray[0] || "User";
+          const lastName = nameArray.length > 1 ? nameArray.slice(1).join(" ") : "";
+
+          // Current user name split
+          const currentUserName = req.user.name ? req.user.name.split(" ") : ["User"];
+          const currentUserFirstName = currentUserName[0] || "User";
+          const currentUserLastName = currentUserName.length > 1 ? currentUserName.slice(1).join(" ") : "";
+
+          // Tạo đối tượng chat
+          chatList.push({
+            id: chat._id,
+            isGroup: false,
+            participants: [
+              {
+                id: userId.toString(),
+                firstName: currentUserFirstName,
+                lastName: currentUserLastName,
+                avatar: req.user.avt || "",
+              },
+              {
+                id: otherUser._id.toString(),
+                firstName: firstName,
+                lastName: lastName,
+                avatar: otherUser.avt || "",
+                email: otherUser.email,
+              },
+            ],
+            lastMessage: {
+              id: chat.lastMessage._id.toString(),
+              content: chat.lastMessage.content,
+              type: chat.lastMessage.type || "text",
+              senderId: chat.lastMessage.sender.toString(),
+              createdAt: chat.lastMessage.createdAt,
+              isRead: chat.lastMessage.isRead || false,
             },
-            {
-              id: otherUser._id,
-              firstName: otherUser.name.split(" ")[0],
-              lastName: otherUser.name.split(" ")[1] || "",
-              avatar: otherUser.avt,
-              email: otherUser.email,
-            },
-          ],
-          lastMessage: {
-            id: chat.lastMessage._id,
-            content: chat.lastMessage.content,
-            type: chat.lastMessage.type || "text",
-            senderId: chat.lastMessage.sender,
-            createdAt: chat.lastMessage.createdAt,
-            isRead: chat.lastMessage.isRead,
-          },
-          unreadCount: unreadCount,
-          updatedAt: chat.updatedAt,
-        });
+            unreadCount: unreadCount,
+            updatedAt: chat.updatedAt,
+          });
+        }
+      } catch (err) {
+        console.error(`Error processing chat ${chat._id}:`, err);
+        // Continue to process the next chat
+        continue;
       }
     }
 
@@ -638,6 +667,7 @@ module.exports = {
   saveMessage,
   getMessages,
   getMessagesBetweenUsers,
+  getRecentChats,
   findMessageById,
   addReaction,
   removeReaction,
@@ -648,6 +678,5 @@ module.exports = {
   cleanupExpiredFiles,
   unsendMessage,
   deleteConversation,
-  getRecentChats,
   uploadToCloudinary
 };

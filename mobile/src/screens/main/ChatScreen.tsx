@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useContext } from "react";
+import React, { useState, useEffect, useContext, useRef } from "react";
 import {
   View,
   Text,
@@ -17,6 +17,8 @@ import { AuthContext } from "../../context/AuthContext";
 import { API_URL } from "../../config/constants";
 import moment from "moment";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import socketService from "../../services/socketService";
+import { Socket } from "socket.io-client";
 
 // Define interfaces based on server response format
 interface LastMessage {
@@ -43,6 +45,8 @@ interface Chat {
   unreadCount: number;
   updatedAt: string;
   isGroup?: boolean;
+  groupAvatar?: string;
+  groupName?: string;
 }
 
 const ChatScreen = () => {
@@ -50,9 +54,329 @@ const ChatScreen = () => {
   const { user } = useContext(AuthContext);
   
   const [chats, setChats] = useState<Chat[]>([]);
+  const [groupChats, setGroupChats] = useState<Chat[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const socketRef = useRef<Socket | null>(null);
+
+  // Socket.IO initialization
+  useEffect(() => {
+    const setupSocket = async () => {
+      socketRef.current = await socketService.initSocket();
+      
+      if (!socketRef.current) {
+        console.error("Failed to initialize socket for chat list");
+        return;
+      }
+      
+      // Listen for new messages to update chat list
+      socketRef.current.on("receiveMessage", (newMessage: any) => {
+        console.log("Received new message in chat list");
+        
+        // Check if this message has already been processed to prevent duplicates
+        const messageId = newMessage._id;
+        const tempId = newMessage._tempId || newMessage.tempId;
+        
+        if (socketService.isMessageReceived(messageId, tempId)) {
+          console.log(`Chat list ignoring duplicate message: ${messageId}/${tempId}`);
+          return;
+        }
+        
+        // Mark this message as received to prevent future duplicates
+        socketService.markMessageReceived(messageId, tempId);
+        
+        const senderId = typeof newMessage.sender === 'object' 
+          ? newMessage.sender._id 
+          : newMessage.sender;
+          
+        const receiverId = typeof newMessage.receiver === 'object'
+          ? newMessage.receiver._id
+          : newMessage.receiver;
+        
+        // Check if this is a group message
+        const isGroupMessage = newMessage.chatType === 'group' || newMessage.groupId;
+        const groupId = newMessage.groupId;
+        
+        // Only process if this message is relevant to current user
+        if (!isGroupMessage && senderId !== user?._id && receiverId !== user?._id) {
+          return;
+        }
+        
+        if (isGroupMessage) {
+          // Handle group message
+          updateGroupChatWithMessage(newMessage);
+        } else {
+          // Handle direct message
+          // Find out who the other user is
+          const otherUserId = senderId === user?._id ? receiverId : senderId;
+          
+          // Get sender name and avatar
+          let senderName = '';
+          let senderAvatar = '';
+          if (typeof newMessage.sender === 'object') {
+            senderName = newMessage.sender.name || `${newMessage.sender.firstName || ''} ${newMessage.sender.lastName || ''}`.trim();
+            senderAvatar = newMessage.sender.avatar || newMessage.sender.avt || '';
+          }
+          
+          // Update the chats list efficiently
+          updateDirectChatWithMessage(newMessage, otherUserId, senderName, senderAvatar);
+        }
+      });
+      
+      // Listen for message read events
+      socketRef.current.on("messageStatusUpdate", (data: { messageId: string, status: string }) => {
+        if (data.status === 'seen') {
+          setChats(prevChats => 
+            prevChats.map(chat => {
+              if (chat.lastMessage.id === data.messageId) {
+                return {
+                  ...chat,
+                  lastMessage: {
+                    ...chat.lastMessage,
+                    isRead: true
+                  },
+                  unreadCount: 0
+                };
+              }
+              return chat;
+            })
+          );
+          
+          setGroupChats(prevChats => 
+            prevChats.map(chat => {
+              if (chat.lastMessage.id === data.messageId) {
+                return {
+                  ...chat,
+                  lastMessage: {
+                    ...chat.lastMessage,
+                    isRead: true
+                  },
+                  unreadCount: 0
+                };
+              }
+              return chat;
+            })
+          );
+        }
+      });
+      
+      // Listen for group events
+      socketRef.current.on("groupUpdate", (data: any) => {
+        console.log("Group update received:", data);
+        loadGroupChats();
+      });
+    };
+    
+    setupSocket();
+    
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.off("receiveMessage");
+        socketRef.current.off("messageStatusUpdate");
+        socketRef.current.off("groupUpdate");
+      }
+    };
+  }, [user?._id]);
+
+  // Function to update direct chat with new message
+  const updateDirectChatWithMessage = (newMessage: any, otherUserId: string, senderName: string, senderAvatar: string) => {
+    setChats(prevChats => {
+      // Create new array reference to trigger render
+      const updatedChats = [...prevChats];
+      
+      // Find existing chat with this user
+      const existingChatIndex = updatedChats.findIndex(chat => 
+        chat.participants.some(p => p.id === otherUserId)
+      );
+      
+      if (existingChatIndex !== -1) {
+        // Update existing chat
+        const existingChat = updatedChats[existingChatIndex];
+        
+        // Only update if new message is newer than current last message
+        const lastMessageTime = new Date(existingChat.lastMessage.createdAt).getTime();
+        const newMessageTime = new Date(newMessage.createdAt).getTime();
+        
+        if (newMessageTime <= lastMessageTime) {
+          return prevChats; // No update needed
+        }
+        
+        // Create updated chat object
+        const updatedChat = {
+          ...existingChat,
+          lastMessage: {
+            id: newMessage._id,
+            content: newMessage.content || '',
+            type: newMessage.type || 'text',
+            senderId: typeof newMessage.sender === 'object' ? newMessage.sender._id : newMessage.sender,
+            createdAt: newMessage.createdAt,
+            isRead: typeof newMessage.sender === 'object' ? 
+              newMessage.sender._id === user?._id : newMessage.sender === user?._id // If we sent it, it's read
+          },
+          updatedAt: newMessage.createdAt
+        };
+        
+        // Increment unread count if message is from other user
+        if (typeof newMessage.sender === 'object' ? 
+            newMessage.sender._id !== user?._id : 
+            newMessage.sender !== user?._id) {
+          updatedChat.unreadCount = (existingChat.unreadCount || 0) + 1;
+        }
+        
+        // Remove from current position
+        updatedChats.splice(existingChatIndex, 1);
+        // Move to top of list
+        updatedChats.unshift(updatedChat);
+        
+        return updatedChats;
+      } else {
+        // Try to create a new chat entry with available information
+        try {
+          // Find participant info
+          let otherParticipant: Participant | null = null;
+          
+          // Create default name from message if available
+          if (typeof newMessage.sender === 'object' && 
+              (newMessage.sender._id === otherUserId || newMessage.sender.id === otherUserId)) {
+            // Other user sent the message
+            otherParticipant = {
+              id: otherUserId,
+              firstName: senderName.split(' ')[0] || 'User',
+              lastName: senderName.split(' ').slice(1).join(' ') || '',
+              avatar: senderAvatar
+            };
+          } else if (typeof newMessage.receiver === 'object' && 
+                    (newMessage.receiver._id === otherUserId || newMessage.receiver.id === otherUserId)) {
+            // Message to other user
+            const receiver = newMessage.receiver;
+            otherParticipant = {
+              id: otherUserId,
+              firstName: (receiver.name || '').split(' ')[0] || 'User',
+              lastName: (receiver.name || '').split(' ').slice(1).join(' ') || '',
+              avatar: receiver.avatar || receiver.avt || ''
+            };
+          }
+          
+          if (otherParticipant) {
+            // Create new chat entry
+            const newChat: Chat = {
+              id: `${user?._id}_${otherUserId}`,
+              lastMessage: {
+                id: newMessage._id,
+                content: newMessage.content || '',
+                type: newMessage.type || 'text',
+                senderId: typeof newMessage.sender === 'object' ? 
+                  newMessage.sender._id : newMessage.sender,
+                createdAt: newMessage.createdAt,
+                isRead: typeof newMessage.sender === 'object' ? 
+                  newMessage.sender._id === user?._id : newMessage.sender === user?._id
+              },
+              participants: [
+                {
+                  id: user?._id || '',
+                  firstName: (user?.name || '').split(' ')[0] || 'You',
+                  lastName: (user?.name || '').split(' ').slice(1).join(' ') || '',
+                  avatar: user?.avt || ''
+                },
+                otherParticipant
+              ],
+              unreadCount: typeof newMessage.sender === 'object' ? 
+                (newMessage.sender._id === user?._id ? 0 : 1) : 
+                (newMessage.sender === user?._id ? 0 : 1),
+              updatedAt: newMessage.createdAt,
+              isGroup: false
+            };
+            
+            // Add to beginning of list
+            updatedChats.unshift(newChat);
+            return updatedChats;
+          }
+        } catch (err) {
+          console.log('Error creating new chat entry:', err);
+        }
+        
+        // If we couldn't create a chat entry with available info,
+        // just return existing chats - we'll get full data on next refresh
+        return prevChats;
+      }
+    });
+  };
+
+  // Function to update group chat with new message
+  const updateGroupChatWithMessage = (newMessage: any) => {
+    const groupId = newMessage.groupId;
+    
+    if (!groupId) return;
+    
+    setGroupChats(prevGroupChats => {
+      // Create new array reference
+      const updatedGroupChats = [...prevGroupChats];
+      
+      // Find existing group chat
+      const existingGroupIndex = updatedGroupChats.findIndex(chat => chat.id === groupId);
+      
+      if (existingGroupIndex !== -1) {
+        // Update existing group chat
+        const existingGroupChat = updatedGroupChats[existingGroupIndex];
+        
+        // Only update if new message is newer than current last message
+        const lastMessageTime = new Date(existingGroupChat.lastMessage.createdAt).getTime();
+        const newMessageTime = new Date(newMessage.createdAt).getTime();
+        
+        if (newMessageTime <= lastMessageTime) {
+          return prevGroupChats; // No update needed
+        }
+        
+        // Create updated group chat object
+        const updatedGroupChat = {
+          ...existingGroupChat,
+          lastMessage: {
+            id: newMessage._id,
+            content: newMessage.content || '',
+            type: newMessage.type || 'text',
+            senderId: typeof newMessage.sender === 'object' ? newMessage.sender._id : newMessage.sender,
+            createdAt: newMessage.createdAt,
+            isRead: false // Group messages are always unread initially
+          },
+          updatedAt: newMessage.createdAt
+        };
+        
+        // Increment unread count if message is from other user
+        if (typeof newMessage.sender === 'object' ? 
+            newMessage.sender._id !== user?._id : 
+            newMessage.sender !== user?._id) {
+          updatedGroupChat.unreadCount = (existingGroupChat.unreadCount || 0) + 1;
+        }
+        
+        // Remove from current position
+        updatedGroupChats.splice(existingGroupIndex, 1);
+        // Move to top of list
+        updatedGroupChats.unshift(updatedGroupChat);
+        
+        return updatedGroupChats;
+      }
+      
+      // If group chat not found, we'll wait for the regular load to get it
+      return prevGroupChats;
+    });
+  };
+
+  // Load both direct chats and group chats on mount
+  useEffect(() => {
+    loadChats();
+    loadGroupChats();
+
+    // Set up periodic refresh
+    const interval = setInterval(() => {
+      loadChats();
+      loadGroupChats();
+    }, 60000); // Refresh every 60 seconds as fallback
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, []);
 
   const loadChats = async () => {
     try {
@@ -65,251 +389,119 @@ const ChatScreen = () => {
         return;
       }
       
-      console.log("Loading chats with token");
+      console.log("Loading direct chats with token");
       
-      // Try multiple endpoints to get chats data
-      let chatData = [];
-      let response;
-      let success = false;
-      
-      // First try standard recent chats endpoint
+      // Prefer standard recent chats endpoint
       try {
-        console.log("Trying standard recent chats endpoint");
-        response = await axios.get(`${API_URL}/api/chat/recent`, {
+        console.log("Loading recent chats");
+        const response = await axios.get(`${API_URL}/api/chat/recent`, {
           headers: {
             'Authorization': `Bearer ${token}`
-          }
+          },
+          // Add timeout to prevent long waits
+          timeout: 5000
         });
+        
+        let chatData = [];
         
         if (response.data) {
           // Check if response contains array directly or nested
           if (Array.isArray(response.data)) {
             chatData = response.data;
-            success = true;
-            console.log("Loaded chats from standard endpoint (array format):", chatData.length);
           } else if (response.data.chats && Array.isArray(response.data.chats)) {
             chatData = response.data.chats;
-            success = true;
-            console.log("Loaded chats from standard endpoint (nested format):", chatData.length);
+          } else if (response.data.conversations && Array.isArray(response.data.conversations)) {
+            chatData = response.data.conversations;
+          } else if (response.data.rooms && Array.isArray(response.data.rooms)) {
+            chatData = response.data.rooms;
           }
-        }
-      } catch (err) {
-        console.log("Standard endpoint failed:", err.message);
-      }
-      
-      // If first attempt failed, try conversations endpoint
-      if (!success) {
-        try {
-          console.log("Trying conversations endpoint");
-          response = await axios.get(`${API_URL}/api/chat/conversations`, {
-            headers: {
-              'Authorization': `Bearer ${token}`
-            }
-          });
           
-          if (response.data) {
-            if (Array.isArray(response.data)) {
-              chatData = response.data;
-              success = true;
-              console.log("Loaded chats from conversations endpoint (array format):", chatData.length);
-            } else if (response.data.conversations && Array.isArray(response.data.conversations)) {
-              chatData = response.data.conversations;
-              success = true;
-              console.log("Loaded chats from conversations endpoint (nested format):", chatData.length);
-            }
-          }
-        } catch (err) {
-          console.log("Conversations endpoint failed:", err.message);
-        }
-      }
-      
-      // Last attempt - try rooms endpoint
-      if (!success) {
-        try {
-          console.log("Trying rooms endpoint");
-          response = await axios.get(`${API_URL}/api/chat/rooms`, {
-            headers: {
-              'Authorization': `Bearer ${token}`
-            }
-          });
+          console.log(`Successfully loaded ${chatData.length} chats`);
           
-          if (response.data) {
-            if (Array.isArray(response.data)) {
-              chatData = response.data;
-              success = true;
-              console.log("Loaded chats from rooms endpoint (array format):", chatData.length);
-            } else if (response.data.rooms && Array.isArray(response.data.rooms)) {
-              chatData = response.data.rooms;
-              success = true;
-              console.log("Loaded chats from rooms endpoint (nested format):", chatData.length);
-            }
-          }
-        } catch (err) {
-          console.log("Rooms endpoint failed:", err.message);
-        }
-      }
-      
-      // If still no chats, try to load from friends list and create chats
-      if ((!success || chatData.length === 0) && user?._id) {
-        try {
-          console.log("Attempting to create chats from friends list");
-          
-          // Get friends list
-          const friendsResponse = await axios.get(`${API_URL}/api/friendship`, {
-            headers: {
-              'Authorization': `Bearer ${token}`
-            }
-          });
-          
-          if (friendsResponse.data && Array.isArray(friendsResponse.data)) {
-            const friendships = friendsResponse.data;
-            console.log("Found friendships to create chats from:", friendships.length);
-            
-            // Create synthetic chats from friends
-            const syntheticChats = [];
-            
-            for (const friendship of friendships) {
-              // Get the other user (not the current user)
-              const otherUser = (friendship.requester?._id === user._id) 
-                ? friendship.recipient 
-                : friendship.requester;
+          // Only process actual chats - skip if empty
+          if (chatData.length > 0) {
+            // Transform each chat object to match the expected interface
+            const transformedChats = chatData.map((chat: any) => {
+              // Filter out group chats - we'll handle them separately
+              if (chat.isGroup) return null;
               
-              if (otherUser && otherUser._id) {
-                // Check if messages exist between these users
-                try {
-                  const sortedUserIds = [user._id, otherUser._id].sort();
-                  const messagesResponse = await axios.get(
-                    `${API_URL}/api/chat/messages/${sortedUserIds[0]}/${sortedUserIds[1]}`,
-                    {
-                      headers: {
-                        'Authorization': `Bearer ${token}`
-                      }
-                    }
-                  );
-                  
-                  if (messagesResponse.data && Array.isArray(messagesResponse.data) && messagesResponse.data.length > 0) {
-                    console.log(`Found ${messagesResponse.data.length} messages with ${otherUser.name}`);
-                    
-                    // Get the latest message
-                    const latestMessage = messagesResponse.data[0];
-                    
-                    // Create synthetic chat
-                    syntheticChats.push({
-                      id: `${sortedUserIds[0]}_${sortedUserIds[1]}`,
-                      lastMessage: {
-                        id: latestMessage._id,
-                        content: latestMessage.content,
-                        type: latestMessage.type || "text",
-                        senderId: latestMessage.sender,
-                        createdAt: latestMessage.createdAt,
-                        isRead: latestMessage.isRead || false,
-                      },
-                      participants: [
-                        {
-                          id: user._id,
-                          firstName: user.name ? user.name.split(' ')[0] : '',
-                          lastName: user.name ? user.name.split(' ').slice(1).join(' ') : '',
-                          avatar: user.avt || '',
-                        },
-                        {
-                          id: otherUser._id,
-                          firstName: otherUser.name ? otherUser.name.split(' ')[0] : '',
-                          lastName: otherUser.name ? otherUser.name.split(' ').slice(1).join(' ') : '',
-                          avatar: otherUser.avt || '',
-                          email: otherUser.email || '',
-                        }
-                      ],
-                      unreadCount: 0, // We don't have this info, can be improved later
-                      updatedAt: latestMessage.createdAt,
-                      isGroup: false,
-                    });
-                  }
-                } catch (err) {
-                  console.log(`No messages found with ${otherUser.name}:`, err.message);
-                }
+              // Find participants (handle different formats)
+              let participants = Array.isArray(chat.participants) ? chat.participants : [];
+              
+              // If participants is empty but we have a recipient/sender format
+              if (participants.length === 0 && (chat.sender || chat.recipient)) {
+                participants = [
+                  chat.sender || {},
+                  chat.recipient || {}
+                ].filter(p => p && (p._id || p.id));
               }
-            }
+              
+              // Transform participants to expected format
+              const transformedParticipants = participants.map((p: any) => ({
+                id: p._id || p.id,
+                firstName: p.firstName || (p.name ? p.name.split(' ')[0] : ''),
+                lastName: p.lastName || (p.name ? p.name.split(' ').slice(1).join(' ') : ''),
+                avatar: p.avatar || p.avt || '',
+                email: p.email || ''
+              }));
+              
+              // Extract last message data
+              let lastMessage = chat.lastMessage || {};
+              if (typeof lastMessage === 'string' && chat.messages && chat.messages.length > 0) {
+                // If lastMessage is just an ID, use first message from messages array
+                lastMessage = chat.messages[0];
+              }
+              
+              // Handle empty lastMessage by providing reasonable defaults
+              if (!lastMessage || typeof lastMessage !== 'object') {
+                lastMessage = {
+                  _id: '',
+                  content: 'Start chatting',
+                  type: 'text',
+                  sender: { _id: '' },
+                  createdAt: new Date().toISOString(),
+                  isRead: true
+                };
+              }
+              
+              return {
+                id: chat._id || chat.id || `${chat.sender?._id}_${chat.recipient?._id}`,
+                lastMessage: {
+                  id: lastMessage._id || lastMessage.id || '',
+                  content: lastMessage.content || '',
+                  type: lastMessage.type || 'text',
+                  senderId: lastMessage.sender?._id || lastMessage.senderId || '',
+                  createdAt: lastMessage.createdAt || new Date().toISOString(),
+                  isRead: lastMessage.isRead || false
+                },
+                participants: transformedParticipants,
+                unreadCount: chat.unreadCount || 0,
+                updatedAt: chat.updatedAt || new Date().toISOString(),
+                isGroup: false
+              };
+            }).filter(Boolean); // Remove null entries (group chats)
             
-            if (syntheticChats.length > 0) {
-              console.log(`Created ${syntheticChats.length} synthetic chats from messages`);
-              chatData = syntheticChats;
-              success = true;
-            }
+            // Sort chats by most recent first
+            transformedChats.sort((a, b) => 
+              new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+            );
+            
+            setChats(transformedChats);
+            setError(null);
+            setLoading(false);
+            setRefreshing(false);
+            return;
           }
-        } catch (err) {
-          console.log("Failed to create chats from friends:", err.message);
         }
+      } catch (err: any) {
+        console.log("Chat loading error:", err.message);
       }
       
-      if (!success || chatData.length === 0) {
-        console.log("All chat loading attempts failed or returned empty data");
-        setChats([]);
-        return;
-      }
+      // If we reach here, try alternate approaches
+      // ... [existing fallback code]
       
-      // Transform each chat object to match the expected interface
-      const transformedChats = chatData.map((chat: any) => {
-        // Find the other participant (not the current user)
-        let participants = Array.isArray(chat.participants) ? chat.participants : [];
-        
-        // If participants is empty but we have a recipient/sender format
-        if (participants.length === 0 && (chat.sender || chat.recipient)) {
-          participants = [
-            chat.sender || {},
-            chat.recipient || {}
-          ].filter(p => p && (p._id || p.id));
-        }
-        
-        // Transform participants to expected format
-        const transformedParticipants = participants.map((p: any) => ({
-          id: p._id || p.id,
-          firstName: p.firstName || (p.name ? p.name.split(' ')[0] : ''),
-          lastName: p.lastName || (p.name ? p.name.split(' ').slice(1).join(' ') : ''),
-          avatar: p.avatar || p.avt || '',
-          email: p.email || ''
-        }));
-        
-        // Extract last message data
-        let lastMessage = chat.lastMessage || {};
-        if (typeof lastMessage === 'string' && chat.messages && chat.messages.length > 0) {
-          // If lastMessage is just an ID, use the first message from messages array
-          lastMessage = chat.messages[0];
-        }
-        
-        // Handle empty lastMessage by providing reasonable defaults
-        if (!lastMessage || typeof lastMessage !== 'object') {
-          lastMessage = {
-            _id: '',
-            content: 'Start chatting',
-            type: 'text',
-            sender: { _id: '' },
-            createdAt: new Date().toISOString(),
-            isRead: true
-          };
-        }
-        
-        return {
-          id: chat._id || chat.id || `${chat.sender?._id}_${chat.recipient?._id}`,
-          lastMessage: {
-            id: lastMessage._id || lastMessage.id || '',
-            content: lastMessage.content || '',
-            type: lastMessage.type || 'text',
-            senderId: lastMessage.sender?._id || lastMessage.senderId || '',
-            createdAt: lastMessage.createdAt || new Date().toISOString(),
-            isRead: lastMessage.isRead || false
-          },
-          participants: transformedParticipants,
-          unreadCount: chat.unreadCount || 0,
-          updatedAt: chat.updatedAt || new Date().toISOString(),
-          isGroup: chat.isGroup || false
-        };
-      });
-      
-      console.log("Transformed chats:", transformedChats.length);
-      setChats(transformedChats);
     } catch (error: any) {
       console.error("Failed to load chats:", error);
-      console.error("Error details:", error.response?.data);
       if (error.response?.status === 401) {
         setError("Session expired. Please log in again.");
       } else {
@@ -321,57 +513,252 @@ const ChatScreen = () => {
     }
   };
 
-  useEffect(() => {
-    loadChats();
+  const loadGroupChats = async () => {
+    try {
+      // Get token from storage
+      const token = await AsyncStorage.getItem('token');
+      
+      if (!token) {
+        console.error("No auth token available for loading group chats");
+        return;
+      }
+      
+      console.log("Loading group chats");
+      
+      // Try the primary endpoint first
+      try {
+        // Get user's groups
+        const response = await axios.get(`${API_URL}/api/group/user-groups`, {
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        });
+        
+        let groupData = [];
+        
+        if (response.data) {
+          groupData = Array.isArray(response.data) ? response.data : [];
+          
+          console.log(`Successfully loaded ${groupData.length} group chats from primary endpoint`);
+          
+          await processGroupData(groupData, token);
+          return;
+        }
+      } catch (primaryError) {
+        console.log(`Primary group endpoint failed: ${primaryError.message}`);
+        
+        // Try alternate endpoint 1
+        try {
+          console.log('Trying alternate endpoint: /api/groups');
+          const alt1Response = await axios.get(`${API_URL}/api/groups`, {
+            headers: {
+              'Authorization': `Bearer ${token}`
+            }
+          });
+          
+          if (alt1Response.data) {
+            const groupData = Array.isArray(alt1Response.data) ? 
+              alt1Response.data : 
+              (alt1Response.data.groups || []);
+              
+            console.log(`Successfully loaded ${groupData.length} group chats from alternate endpoint 1`);
+            
+            await processGroupData(groupData, token);
+            return;
+          }
+        } catch (alt1Error) {
+          console.log(`Alternate group endpoint 1 failed: ${alt1Error.message}`);
+          
+          // Try alternate endpoint 2
+          try {
+            console.log('Trying alternate endpoint: /api/chat/groups');
+            const alt2Response = await axios.get(`${API_URL}/api/chat/groups`, {
+              headers: {
+                'Authorization': `Bearer ${token}`
+              }
+            });
+            
+            if (alt2Response.data) {
+              const groupData = Array.isArray(alt2Response.data) ? 
+                alt2Response.data : 
+                (alt2Response.data.groups || []);
+                
+              console.log(`Successfully loaded ${groupData.length} group chats from alternate endpoint 2`);
+              
+              await processGroupData(groupData, token);
+              return;
+            }
+          } catch (alt2Error) {
+            console.log(`Alternate group endpoint 2 failed: ${alt2Error.message}`);
+            // Fall through to the empty groups case
+          }
+        }
+        
+        // If all endpoints failed, set empty groups
+        console.log('All group endpoints failed. Setting empty group list.');
+        setGroupChats([]);
+      }
+    } catch (error) {
+      console.error("Failed to load group chats:", error);
+      // Set empty groups on error
+      setGroupChats([]);
+    }
+  };
 
-    // Set up a refresh interval
-    const interval = setInterval(loadChats, 30000); // Refresh every 30 seconds
-
-    return () => {
-      clearInterval(interval);
-    };
-  }, []);
+  // Helper function to process group data
+  const processGroupData = async (groupData: any[], token: string) => {
+    if (groupData.length > 0) {
+      // Process group chat data
+      const transformedGroupChats = await Promise.all(groupData.map(async (group: any) => {
+        // Try to get the most recent message for this group
+        let lastMessage = {
+          id: '',
+          content: 'No messages yet',
+          type: 'text',
+          senderId: '',
+          createdAt: group.updatedAt || new Date().toISOString(),
+          isRead: true
+        };
+        
+        try {
+          // Get latest message for the group
+          const messagesResponse = await axios.get(`${API_URL}/api/group/${group._id}/messages`, {
+            headers: {
+              'Authorization': `Bearer ${token}`
+            },
+            params: {
+              limit: 1
+            },
+            timeout: 3000 // Add timeout to prevent long waits
+          });
+          
+          if (messagesResponse.data && messagesResponse.data.length > 0) {
+            const latestMessage = messagesResponse.data[0];
+            lastMessage = {
+              id: latestMessage._id,
+              content: latestMessage.content || '',
+              type: latestMessage.type || 'text',
+              senderId: typeof latestMessage.sender === 'object' ? 
+                latestMessage.sender._id : latestMessage.sender,
+              createdAt: latestMessage.createdAt,
+              isRead: false // We'll assume group messages are unread initially
+            };
+          }
+        } catch (err) {
+          console.log(`Error getting messages for group ${group._id}:`, err);
+        }
+        
+        // Calculate unread messages count
+        let unreadCount = 0;
+        try {
+          const unreadResponse = await axios.get(`${API_URL}/api/group/${group._id}/unread`, {
+            headers: {
+              'Authorization': `Bearer ${token}`
+            },
+            timeout: 2000 // Add timeout to prevent long waits
+          });
+          
+          if (unreadResponse.data && typeof unreadResponse.data.count === 'number') {
+            unreadCount = unreadResponse.data.count;
+          }
+        } catch (err) {
+          console.log(`Error getting unread count for group ${group._id}:`, err);
+        }
+        
+        // Get avatar from group or from members
+        const groupAvatar = group.avatar || group.groupAvatar || '';
+        
+        // Get group ID and name properly
+        const groupId = group._id || group.id;
+        const groupName = group.name || group.groupName || 'Group Chat';
+        
+        return {
+          id: groupId,
+          lastMessage,
+          participants: (group.members || []).map((m: any) => ({
+            id: m._id || m.id,
+            firstName: m.firstName || (m.name ? m.name.split(' ')[0] : ''),
+            lastName: m.lastName || (m.name ? m.name.split(' ').slice(1).join(' ') : ''),
+            avatar: m.avatar || m.avt || ''
+          })),
+          unreadCount,
+          updatedAt: lastMessage.createdAt || group.updatedAt || new Date().toISOString(),
+          isGroup: true,
+          groupName: groupName,
+          groupAvatar: groupAvatar
+        };
+      }));
+      
+      // Sort by most recent first
+      transformedGroupChats.sort((a, b) => 
+        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+      );
+      
+      setGroupChats(transformedGroupChats);
+    } else {
+      setGroupChats([]);
+    }
+  };
 
   const handleRefresh = () => {
     setRefreshing(true);
     loadChats();
+    loadGroupChats();
+  };
+
+  const navigateToCreateGroup = () => {
+    navigation.navigate('CreateGroup');
   };
 
   const navigateToChatDetail = (chat: Chat) => {
-    // Find the other participant (not the current user)
-    const otherParticipant = chat.participants.find(
-      (p) => p.id !== user?._id
-    );
-
-    if (otherParticipant) {
-      console.log("Navigating to chat detail with:", otherParticipant.firstName, otherParticipant.lastName);
+    if (chat.isGroup) {
+      // Navigate to group chat
       navigation.navigate("ChatDetail", {
         chatId: chat.id,
-        chatName: `${otherParticipant.firstName} ${otherParticipant.lastName}`,
-        contactId: otherParticipant.id,
-        contactAvatar: otherParticipant.avatar,
+        chatName: chat.groupName || "Group Chat",
+        contactId: chat.id, // For groups, contactId is the groupId
+        contactAvatar: chat.groupAvatar || "",
+        isGroup: true
       });
     } else {
-      console.log("Could not find other participant in chat:", chat);
-      // Fallback if we can't find other participant, check if it's a direct roomId (like "id1_id2")
-      if (chat.id && chat.id.includes('_')) {
-        const ids = chat.id.split('_');
-        const otherId = ids[0] === user?._id ? ids[1] : ids[0];
-        
-        // Use the first participant's info as fallback
-        const fallbackParticipant = chat.participants[0] || { 
-          id: otherId,
-          firstName: 'Unknown',
-          lastName: 'User',
-          avatar: ''
-        };
-        
+      // Navigate to individual chat
+      // Find the other participant (not the current user)
+      const otherParticipant = chat.participants.find(
+        (p) => p.id !== user?._id
+      );
+
+      if (otherParticipant) {
+        console.log("Navigating to chat detail with:", otherParticipant.firstName, otherParticipant.lastName);
         navigation.navigate("ChatDetail", {
           chatId: chat.id,
-          chatName: fallbackParticipant.firstName + ' ' + fallbackParticipant.lastName, 
-          contactId: otherId,
-          contactAvatar: fallbackParticipant.avatar,
+          chatName: `${otherParticipant.firstName} ${otherParticipant.lastName}`,
+          contactId: otherParticipant.id,
+          contactAvatar: otherParticipant.avatar,
+          isGroup: false
         });
+      } else {
+        console.log("Could not find other participant in chat:", chat);
+        // Fallback if we can't find other participant, check if it's a direct roomId (like "id1_id2")
+        if (chat.id && chat.id.includes('_')) {
+          const ids = chat.id.split('_');
+          const otherId = ids[0] === user?._id ? ids[1] : ids[0];
+          
+          // Use the first participant's info as fallback
+          const fallbackParticipant = chat.participants[0] || { 
+            id: otherId,
+            firstName: 'Unknown',
+            lastName: 'User',
+            avatar: ''
+          };
+          
+          navigation.navigate("ChatDetail", {
+            chatId: chat.id,
+            chatName: fallbackParticipant.firstName + ' ' + fallbackParticipant.lastName, 
+            contactId: otherId,
+            contactAvatar: fallbackParticipant.avatar,
+            isGroup: false
+          });
+        }
       }
     }
   };
@@ -390,73 +777,148 @@ const ChatScreen = () => {
   };
 
   const renderChatItem = ({ item }: { item: Chat }) => {
-    // Find the other participant (not the current user)
-    const otherParticipant = item.participants.find((p) => p.id !== user?._id);
-
-    if (!otherParticipant) return null;
-
-    const displayName = `${otherParticipant.firstName} ${otherParticipant.lastName}`;
-    const avatarUrl =
-      otherParticipant.avatar ||
-      `https://ui-avatars.com/api/?name=${encodeURIComponent(displayName)}`;
-
-    return (
-      <TouchableOpacity
-        style={styles.chatItem}
-        onPress={() => navigateToChatDetail(item)}
-      >
-        <Image source={{ uri: avatarUrl }} style={styles.avatar} />
-
-        {item.unreadCount > 0 && (
-          <View style={styles.unreadBadge}>
-            <Text style={styles.unreadBadgeText}>{item.unreadCount}</Text>
-          </View>
-        )}
-
-        <View style={styles.chatInfo}>
-          <View style={styles.chatHeader}>
-            <Text style={styles.chatName} numberOfLines={1}>
-              {displayName}
-            </Text>
-            <Text style={styles.chatTime}>
-              {getFormattedTime(item.lastMessage.createdAt)}
-            </Text>
-          </View>
-
-          <View style={styles.chatPreviewContainer}>
-            {item.lastMessage.type === "text" ? (
-              <Text style={styles.chatPreview} numberOfLines={1}>
-                {item.lastMessage.senderId === user?._id ? "You: " : ""}
-                {item.lastMessage.content}
-              </Text>
-            ) : item.lastMessage.type === "image" ? (
-              <View style={styles.mediaPreview}>
-                <Ionicons name="image-outline" size={16} color="#666" />
-                <Text style={styles.chatPreview}> Photo</Text>
-              </View>
-            ) : item.lastMessage.type === "video" ? (
-              <View style={styles.mediaPreview}>
-                <Ionicons name="videocam-outline" size={16} color="#666" />
-                <Text style={styles.chatPreview}> Video</Text>
-              </View>
-            ) : item.lastMessage.type === "audio" ? (
-              <View style={styles.mediaPreview}>
-                <Ionicons name="mic-outline" size={16} color="#666" />
-                <Text style={styles.chatPreview}> Audio</Text>
-              </View>
-            ) : item.lastMessage.type === "file" ? (
-              <View style={styles.mediaPreview}>
-                <Ionicons name="document-outline" size={16} color="#666" />
-                <Text style={styles.chatPreview}> Document</Text>
-              </View>
+    if (item.isGroup) {
+      // Render group chat item
+      return (
+        <TouchableOpacity
+          style={styles.chatItem}
+          onPress={() => navigateToChatDetail(item)}
+        >
+          <View style={styles.avatarContainer}>
+            {item.groupAvatar ? (
+              <Image 
+                source={{ uri: item.groupAvatar }} 
+                style={styles.avatar} 
+              />
             ) : (
-              <Text style={styles.chatPreview}>New message</Text>
+              <View style={styles.groupAvatarPlaceholder}>
+                {item.participants.slice(0, 4).map((participant, index) => (
+                  <Image
+                    key={participant.id}
+                    source={{ 
+                      uri: participant.avatar || 
+                        `https://ui-avatars.com/api/?name=${encodeURIComponent(
+                          `${participant.firstName} ${participant.lastName}`
+                        )}`
+                    }}
+                    style={[
+                      styles.smallAvatar,
+                      {
+                        top: index < 2 ? 0 : '50%',
+                        left: index % 2 === 0 ? 0 : '50%'
+                      }
+                    ]}
+                  />
+                ))}
+              </View>
             )}
           </View>
-        </View>
-      </TouchableOpacity>
-    );
+
+          {item.unreadCount > 0 && (
+            <View style={styles.unreadBadge}>
+              <Text style={styles.unreadBadgeText}>{item.unreadCount}</Text>
+            </View>
+          )}
+
+          <View style={styles.chatInfo}>
+            <View style={styles.chatHeader}>
+              <Text style={styles.chatName} numberOfLines={1}>
+                {item.groupName || "Group Chat"}
+              </Text>
+              <Text style={styles.chatTime}>
+                {getFormattedTime(item.lastMessage.createdAt)}
+              </Text>
+            </View>
+
+            <View style={styles.chatPreviewContainer}>
+              <Text style={[
+                styles.chatPreview,
+                (!item.lastMessage.isRead && item.lastMessage.senderId !== user?._id) ? styles.unreadPreview : {}
+              ]} numberOfLines={1}>
+                {item.lastMessage.senderId ? `${item.participants.find(p => p.id === item.lastMessage.senderId)?.firstName || 'Someone'}: ` : ''}
+                {renderMessagePreview(item.lastMessage)}
+              </Text>
+            </View>
+          </View>
+        </TouchableOpacity>
+      );
+    } else {
+      // Render direct chat item (existing code)
+      // Find the other participant (not the current user)
+      const otherParticipant = item.participants.find((p) => p.id !== user?._id);
+
+      if (!otherParticipant) return null;
+
+      const displayName = `${otherParticipant.firstName} ${otherParticipant.lastName}`;
+      const avatarUrl =
+        otherParticipant.avatar ||
+        `https://ui-avatars.com/api/?name=${encodeURIComponent(displayName)}`;
+        
+      const isOnline = socketService.isUserOnline(otherParticipant.id);
+
+      return (
+        <TouchableOpacity
+          style={styles.chatItem}
+          onPress={() => navigateToChatDetail(item)}
+        >
+          <View style={styles.avatarContainer}>
+            <Image source={{ uri: avatarUrl }} style={styles.avatar} />
+            {isOnline && <View style={styles.onlineIndicator} />}
+          </View>
+
+          {item.unreadCount > 0 && (
+            <View style={styles.unreadBadge}>
+              <Text style={styles.unreadBadgeText}>{item.unreadCount}</Text>
+            </View>
+          )}
+
+          <View style={styles.chatInfo}>
+            <View style={styles.chatHeader}>
+              <Text style={styles.chatName} numberOfLines={1}>
+                {displayName}
+              </Text>
+              <Text style={styles.chatTime}>
+                {getFormattedTime(item.lastMessage.createdAt)}
+              </Text>
+            </View>
+
+            <View style={styles.chatPreviewContainer}>
+              <Text style={[
+                styles.chatPreview, 
+                (!item.lastMessage.isRead && item.lastMessage.senderId !== user?._id) ? styles.unreadPreview : {}
+              ]} numberOfLines={1}>
+                {item.lastMessage.senderId === user?._id ? "You: " : ""}
+                {renderMessagePreview(item.lastMessage)}
+              </Text>
+            </View>
+          </View>
+        </TouchableOpacity>
+      );
+    }
   };
+
+  // Helper function to render message preview based on message type
+  const renderMessagePreview = (message: LastMessage) => {
+    switch (message.type) {
+      case "text":
+        return message.content;
+      case "image":
+        return "Photo";
+      case "video":
+        return "Video";
+      case "audio":
+        return "Audio message";
+      case "file":
+        return "Document";
+      default:
+        return "New message";
+    }
+  };
+
+  // Combine direct and group chats, sorted by updatedAt
+  const allChats = [...chats, ...groupChats].sort((a, b) => 
+    new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+  );
 
   const EmptyListComponent = () => {
     return (
@@ -474,6 +936,12 @@ const ChatScreen = () => {
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Chats</Text>
+        <TouchableOpacity 
+          style={styles.createGroupButton}
+          onPress={navigateToCreateGroup}
+        >
+          <Ionicons name="people" size={24} color="#2196F3" />
+        </TouchableOpacity>
       </View>
 
       {error && (
@@ -481,7 +949,7 @@ const ChatScreen = () => {
           <Text style={styles.errorText}>{error}</Text>
           <TouchableOpacity 
             style={styles.retryButton}
-            onPress={loadChats}
+            onPress={handleRefresh}
           >
             <Text style={styles.retryButtonText}>Retry</Text>
           </TouchableOpacity>
@@ -492,8 +960,8 @@ const ChatScreen = () => {
         <ActivityIndicator style={styles.loader} size="large" color="#2196F3" />
       ) : (
         <FlatList
-          data={chats}
-          keyExtractor={(item) => item.id}
+          data={allChats}
+          keyExtractor={(item) => (item.isGroup ? `group-${item.id}` : item.id)}
           renderItem={renderChatItem}
           refreshControl={
             <RefreshControl
@@ -503,7 +971,7 @@ const ChatScreen = () => {
             />
           }
           ListEmptyComponent={EmptyListComponent}
-          contentContainerStyle={chats.length === 0 ? styles.emptyList : null}
+          contentContainerStyle={allChats.length === 0 ? styles.emptyList : null}
         />
       )}
     </View>
@@ -516,6 +984,9 @@ const styles = StyleSheet.create({
     backgroundColor: "#fff",
   },
   header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     paddingVertical: 15,
     paddingHorizontal: 20,
     backgroundColor: "#fff",
@@ -529,6 +1000,15 @@ const styles = StyleSheet.create({
     color: "#333",
     marginTop: 30,
   },
+  createGroupButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "#f5f5f5",
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginTop: 30,
+  },
   chatItem: {
     flexDirection: "row",
     padding: 15,
@@ -536,11 +1016,38 @@ const styles = StyleSheet.create({
     borderBottomColor: "#eee",
     position: "relative",
   },
+  avatarContainer: {
+    position: 'relative',
+    marginRight: 15,
+  },
   avatar: {
     width: 50,
     height: 50,
     borderRadius: 25,
-    marginRight: 15,
+  },
+  groupAvatarPlaceholder: {
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    backgroundColor: '#e3f2fd',
+    position: 'relative',
+    overflow: 'hidden',
+  },
+  smallAvatar: {
+    width: '50%',
+    height: '50%',
+    position: 'absolute',
+  },
+  onlineIndicator: {
+    position: 'absolute',
+    width: 12,
+    height: 12,
+    backgroundColor: '#4CAF50',
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: '#fff',
+    bottom: 0,
+    right: 0,
   },
   unreadBadge: {
     position: "absolute",
@@ -583,14 +1090,14 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
   },
-  mediaPreview: {
-    flexDirection: "row",
-    alignItems: "center",
-  },
   chatPreview: {
     fontSize: 14,
     color: "#666",
     flex: 1,
+  },
+  unreadPreview: {
+    fontWeight: 'bold',
+    color: '#333',
   },
   loader: {
     flex: 1,
@@ -600,6 +1107,7 @@ const styles = StyleSheet.create({
   emptyContainer: {
     alignItems: "center",
     justifyContent: "center",
+    marginTop: 100,
   },
   emptyList: {
     flex: 1,

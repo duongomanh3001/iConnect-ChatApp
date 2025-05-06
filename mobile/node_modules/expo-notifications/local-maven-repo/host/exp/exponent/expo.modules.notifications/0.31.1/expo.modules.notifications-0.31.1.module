@@ -1,0 +1,156 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "host.exp.exponent",
+    "module": "expo.modules.notifications",
+    "version": "0.31.1",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.13"
+    }
+  },
+  "variants": [
+    {
+      "name": "releaseVariantReleaseApiPublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-api"
+      },
+      "files": [
+        {
+          "name": "expo.modules.notifications-0.31.1.aar",
+          "url": "expo.modules.notifications-0.31.1.aar",
+          "size": 384834,
+          "sha512": "615ff8e2a6ec1796aa71c2a84c0fa512ebde4d0747454179743afd17f13f079c5d6fa38623556a1a5f4f8f3bacb78f7d48da2e5fd9852a66098701f772802c18",
+          "sha256": "23a9be6663f1b507bea568cef65e01b7bf357f7cf7903fe562ad557d54501f4b",
+          "sha1": "5676c7b003206808674304465cfd69c3e1a519b6",
+          "md5": "5c2a94f4f0a6d8180e989e79827fa52b"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseRuntimePublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-parcelize-runtime",
+          "version": {
+            "requires": "2.0.21"
+          }
+        },
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib-jdk7",
+          "version": {
+            "requires": "2.0.21"
+          }
+        },
+        {
+          "group": "androidx.core",
+          "module": "core",
+          "version": {
+            "requires": "1.6.0"
+          }
+        },
+        {
+          "group": "androidx.lifecycle",
+          "module": "lifecycle-runtime",
+          "version": {
+            "requires": "2.2.0"
+          }
+        },
+        {
+          "group": "androidx.lifecycle",
+          "module": "lifecycle-process",
+          "version": {
+            "requires": "2.2.0"
+          }
+        },
+        {
+          "group": "androidx.lifecycle",
+          "module": "lifecycle-common-java8",
+          "version": {
+            "requires": "2.2.0"
+          }
+        },
+        {
+          "group": "org.jetbrains.kotlinx",
+          "module": "kotlinx-coroutines-android",
+          "version": {
+            "requires": "1.7.3"
+          }
+        },
+        {
+          "group": "com.google.firebase",
+          "module": "firebase-messaging",
+          "version": {
+            "requires": "24.0.1"
+          }
+        },
+        {
+          "group": "me.leolin",
+          "module": "ShortcutBadger",
+          "version": {
+            "requires": "1.1.22"
+          },
+          "excludes": [
+            {
+              "group": "*",
+              "module": "*"
+            }
+          ],
+          "thirdPartyCompatibility": {
+            "artifactSelector": {
+              "name": "ShortcutBadger",
+              "type": "aar",
+              "extension": "aar"
+            }
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "expo.modules.notifications-0.31.1.aar",
+          "url": "expo.modules.notifications-0.31.1.aar",
+          "size": 384834,
+          "sha512": "615ff8e2a6ec1796aa71c2a84c0fa512ebde4d0747454179743afd17f13f079c5d6fa38623556a1a5f4f8f3bacb78f7d48da2e5fd9852a66098701f772802c18",
+          "sha256": "23a9be6663f1b507bea568cef65e01b7bf357f7cf7903fe562ad557d54501f4b",
+          "sha1": "5676c7b003206808674304465cfd69c3e1a519b6",
+          "md5": "5c2a94f4f0a6d8180e989e79827fa52b"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseSourcePublication",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "expo.modules.notifications-0.31.1-sources.jar",
+          "url": "expo.modules.notifications-0.31.1-sources.jar",
+          "size": 99335,
+          "sha512": "fa1238b48d02574d49ce1d350cd2798799108c9cebf2d0c31b1935aa5df1a5bb0aeda971929615e6ac80337262610fc35a17c98698ed9297ee0c877895d624ea",
+          "sha256": "c025165651c595088ed4caf14c37e475a573774a65fe3a4ac00426efa8f241ab",
+          "sha1": "7bf0d3fa2df89a4ab7bd6896781ef76c3354f678",
+          "md5": "f903db2d952ca23cb0bc9f01a8cd60a9"
+        }
+      ]
+    }
+  ]
+}

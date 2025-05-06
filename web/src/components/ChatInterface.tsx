@@ -209,21 +209,54 @@ const ChatInterface: React.FC = () => {
     }
   };
 
-  // Khởi tạo socket
+  // Khởi tạo socket với token auth
   useEffect(() => {
     const token = localStorage.getItem("token");
     if (!token || !user) return;
 
+    // Cấu hình socket với token auth
     const newSocket = io("http://localhost:3005", {
       auth: {
         token,
       },
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 3000,
+      timeout: 10000,
     });
 
     setSocket(newSocket);
 
+    // Lắng nghe sự kiện kết nối
+    newSocket.on("connect", () => {
+      console.log("Socket connected with ID:", newSocket.id);
+    });
+
+    // Lắng nghe lỗi kết nối
+    newSocket.on("connect_error", (error) => {
+      console.error("Socket connection error:", error);
+    });
+
+    // Lắng nghe tin nhắn mới
     newSocket.on("receiveMessage", (data: any) => {
       console.log("Nhận tin nhắn mới:", data);
+      // Xử lý tin nhắn tạm thời (đã gửi nhưng chưa nhận được phản hồi từ server)
+      if (data._tempId) {
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg._id === data._tempId ? { ...data, _tempId: data._tempId } : msg
+          )
+        );
+        return;
+      }
+
+      // Xác định xem tin nhắn có phải của người dùng hiện tại không
+      const isFromCurrentUser =
+        typeof data.sender === "string"
+          ? data.sender === user?._id
+          : data.sender._id === user?._id;
+
+      // Chuyển đổi dữ liệu nhận được để khớp với định dạng Message
       const newMessage: Message = {
         _id: data._id,
         sender: data.sender,
@@ -250,51 +283,28 @@ const ChatInterface: React.FC = () => {
         ...(data.expiryDate ? { expiryDate: data.expiryDate } : {}),
       };
 
-      // Xử lý cập nhật tin nhắn tạm nếu có
-      if (data._tempId) {
-        // Thay thế tin nhắn tạm thời bằng tin nhắn thật từ server thay vì thêm tin nhắn mới
-        setMessages((prev) =>
-          prev.map((msg) =>
-            msg._id === data._tempId ? { ...newMessage, _tempId: data._tempId } : msg
-          )
-        );
-        // Thêm return để không thêm tin nhắn mới nếu đã có tin nhắn tạm
-        return;
-      }
+      // Tin nhắn đến từ người khác và là cuộc trò chuyện hiện tại
+      const isCurrentConversation =
+        (typeof data.sender === "string" && data.sender === friendId) ||
+        (typeof data.sender !== "string" && data.sender._id === friendId);
 
-      // Kiểm tra tin nhắn đến từ user hiện tại không (có thể từ tab khác)
-      const isFromCurrentUser =
-        typeof data.sender === "string"
-          ? data.sender === user?._id
-          : data.sender._id === user?._id;
+      // Thêm tin nhắn vào danh sách
+      setMessages((prev) => [...prev, newMessage]);
 
-      if (isFromCurrentUser) {
-        // Chỉ thêm vào danh sách tin nhắn
-        setMessages((prev) => [...prev, newMessage]);
-      } else {
-        // Kiểm tra xem có đang ở trong cuộc trò chuyện với người gửi không
-        const isCurrentConversation =
-          (typeof data.sender === "string" && data.sender === friendId) ||
-          (typeof data.sender !== "string" && data.sender._id === friendId);
-
-        // Thêm tin nhắn vào danh sách
-        setMessages((prev) => [...prev, newMessage]);
-
-        // Nếu không phải là cuộc trò chuyện hiện tại, tăng số tin nhắn chưa đọc
-        if (!isCurrentConversation) {
-          console.log("Tăng số tin nhắn chưa đọc");
-          dispatch(incrementUnreadMessages());
-        } else {
-          // Đánh dấu là đã đọc nếu đang trong cuộc trò chuyện
-          if (socket) {
-            socket.emit("messageDelivered", { messageId: data._id });
-          }
+      // Đánh dấu đã đọc nếu là cuộc trò chuyện hiện tại và không phải do chính mình gửi
+      if (isCurrentConversation && !isFromCurrentUser) {
+        if (socket) {
+          socket.emit("messageRead", {
+            messageId: data._id,
+            sender: typeof data.sender === "string" ? data.sender : data.sender._id,
+            receiver: user._id,
+          });
         }
       }
     });
 
     // Lắng nghe trạng thái tin nhắn
-    newSocket.on("messageStatus", (data: any) => {
+    newSocket.on("messageStatusUpdate", (data: any) => {
       setMessages((prev) =>
         prev.map((msg) =>
           msg._id === data.messageId ? { ...msg, status: data.status } : msg
@@ -302,7 +312,7 @@ const ChatInterface: React.FC = () => {
       );
     });
 
-    // Thêm sự kiện unsendMessage
+    // Lắng nghe sự kiện tin nhắn đã thu hồi
     newSocket.on("messageUnsent", (data: { messageId: string }) => {
       console.log("Tin nhắn đã bị thu hồi:", data);
       setMessages((prevMessages) =>
@@ -357,18 +367,6 @@ const ChatInterface: React.FC = () => {
         setIsTyping(false);
       }
     });
-
-    // Lắng nghe sự kiện cập nhật trạng thái tin nhắn
-    newSocket.on(
-      "messageStatusUpdate",
-      (data: { messageId: string; status: "delivered" | "seen" }) => {
-        setMessages((prevMessages) =>
-          prevMessages.map((msg) =>
-            msg._id === data.messageId ? { ...msg, status: data.status } : msg
-          )
-        );
-      }
-    );
 
     // Lắng nghe reactions
     newSocket.on(
@@ -535,7 +533,7 @@ const ChatInterface: React.FC = () => {
     }
 
     // Tạo ID tạm thời cho tin nhắn
-    const tempId = Date.now().toString();
+    const tempId = `temp-${Date.now()}`;
 
     // Tạo tin nhắn tạm thời để hiển thị ngay lập tức
     const tempMessage: Message = {
@@ -561,11 +559,16 @@ const ChatInterface: React.FC = () => {
     // Thêm tin nhắn tạm vào danh sách
     setMessages((prev) => [...prev, tempMessage]);
 
+    // Tạo roomId từ ID người dùng đã sắp xếp
+    const userIds = [user._id, friendId].sort();
+    const roomId = `${userIds[0]}_${userIds[1]}`;
+
     console.log("Gửi tin nhắn:", {
       sender: user._id,
       receiver: friendId,
       content: newMessage,
       tempId, // Gửi ID tạm để server có thể cập nhật sau
+      roomId, // Thêm roomId để đảm bảo nhất quán với mobile
       chatType: "private",
       ...(replyToMessage ? { replyToId: replyToMessage._id } : {}),
     });
@@ -575,6 +578,7 @@ const ChatInterface: React.FC = () => {
       receiver: friendId,
       content: newMessage,
       tempId,
+      roomId,
       chatType: "private",
       ...(replyToMessage ? { replyToId: replyToMessage._id } : {}),
     });

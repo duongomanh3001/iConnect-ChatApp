@@ -21,6 +21,14 @@ import ChatDetailScreen from "../screens/main/ChatDetailScreen";
 import ContactDetailScreen from "../screens/main/ContactDetailScreen";
 import EditProfileScreen from "../screens/main/EditProfileScreen";
 
+// Group Chat Screens
+import CreateGroupScreen from "../screens/group/CreateGroupScreen";
+import GroupInfoScreen from "../screens/group/GroupInfoScreen";
+import AddGroupMembersScreen from "../screens/group/AddGroupMembersScreen";
+
+// Common Screens
+import ConnectionErrorScreen from "../screens/common/ConnectionErrorScreen";
+
 // Stack Navigator Types
 type AuthStackParamList = {
   Login: undefined;
@@ -36,6 +44,7 @@ type MainStackParamList = {
     chatName: string;
     contactId: string;
     contactAvatar?: string;
+    isGroup?: boolean;
   };
   ContactDetail: {
     contactId: string;
@@ -43,6 +52,16 @@ type MainStackParamList = {
   };
   EditProfile: {
     user: any;
+  };
+  CreateGroup: undefined;
+  GroupInfo: {
+    groupId: string;
+    groupName: string;
+    groupAvatar?: string;
+  };
+  AddGroupMembers: {
+    groupId: string;
+    currentMembers: any[];
   };
 };
 
@@ -137,21 +156,31 @@ const MainNavigator = () => {
       <MainStack.Screen name="ChatDetail" component={ChatDetailScreen} />
       <MainStack.Screen name="ContactDetail" component={ContactDetailScreen} />
       <MainStack.Screen name="EditProfile" component={EditProfileScreen} />
+      <MainStack.Screen name="CreateGroup" component={CreateGroupScreen} />
+      <MainStack.Screen name="GroupInfo" component={GroupInfoScreen} />
+      <MainStack.Screen name="AddGroupMembers" component={AddGroupMembersScreen} />
     </MainStack.Navigator>
   );
 };
 
+// Loading indicator component
+const LoadingScreen = () => (
+  <View style={{ flex: 1, justifyContent: "center", alignItems: "center" }}>
+    <ActivityIndicator size="large" color="#2196F3" />
+  </View>
+);
+
 // Root navigator
 const AppNavigator = () => {
-  const { isLoading, token } = useContext(AuthContext);
+  const { isLoading, token, apiConnected } = useContext(AuthContext);
 
   if (isLoading) {
-    // Display loading screen while checking authentication state
-    return (
-      <View style={{ flex: 1, justifyContent: "center", alignItems: "center" }}>
-        <ActivityIndicator size="large" color="#2196F3" />
-      </View>
-    );
+    return <LoadingScreen />;
+  }
+
+  // Kiểm tra kết nối API
+  if (!apiConnected) {
+    return <ConnectionErrorScreen />;
   }
 
   // Navigate based on authentication state

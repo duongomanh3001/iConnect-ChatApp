@@ -36,7 +36,8 @@
     "react-native-web": "^0.20.0",
     "socket.io-client": "^4.8.1",
     "@cloudinary/url-gen": "^1.14.0",
-    "@cloudinary/react-native": "^0.0.2"
+    "@cloudinary/react-native": "0.0.2",
+    "expo-notifications": "~0.31.1"
   },
   "devDependencies": {
     "@babel/core": "^7.27.1",
